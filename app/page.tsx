@@ -38,7 +38,7 @@ export default function LandingPage() {
       {/* Footer */}
       <footer className="border-t border-border py-8">
         <div className="container mx-auto px-4 text-center text-xs text-muted-foreground">
-          © 2026 iCreaTechs. All rights reserved.
+          © 2026 MortarLab. All rights reserved.
         </div>
       </footer>
     </div>

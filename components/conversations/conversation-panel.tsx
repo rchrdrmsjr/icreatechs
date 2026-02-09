@@ -226,6 +226,28 @@ export const ConversationPanel = ({
     if (!conversationId) return;
 
     setSending(true);
+    const now = new Date().toISOString();
+    const makeTempId = () =>
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `temp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: makeTempId(),
+        role: "user",
+        content: message,
+        status: "completed",
+        created_at: now,
+      },
+      {
+        id: makeTempId(),
+        role: "assistant",
+        content: "",
+        status: "processing",
+        created_at: now,
+      },
+    ]);
     try {
       const response = await fetch("/api/messages", {
         method: "POST",
