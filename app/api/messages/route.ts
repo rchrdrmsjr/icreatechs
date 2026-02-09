@@ -179,7 +179,8 @@ export async function POST(request: NextRequest) {
             tokens_used: payloadData?.data?.usage?.totalTokens ?? null,
             updated_at: new Date().toISOString(),
           })
-          .eq("id", assistantMessageId);
+          .eq("id", assistantMessageId)
+          .eq("status", "processing");
 
         if (updateError) {
           throw updateError;
@@ -191,14 +192,23 @@ export async function POST(request: NextRequest) {
         });
       } catch (error) {
         if (assistantMessageId) {
-          await supabase
+          const { data: currentMessage } = await supabase
             .from("messages")
-            .update({
-              status: "failed",
-              content: "Sorry, I ran into an error. Please try again.",
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", assistantMessageId);
+            .select("status")
+            .eq("id", assistantMessageId)
+            .maybeSingle();
+
+          if (currentMessage?.status !== "cancelled") {
+            await supabase
+              .from("messages")
+              .update({
+                status: "failed",
+                content: "Sorry, I ran into an error. Please try again.",
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", assistantMessageId)
+              .eq("status", "processing");
+          }
         }
 
         Sentry.captureException(error);

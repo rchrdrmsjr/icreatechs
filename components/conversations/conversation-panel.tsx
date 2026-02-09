@@ -54,10 +54,12 @@ export const ConversationPanel = ({
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [loadingConversations, setLoadingConversations] = useState(false);
   const [sending, setSending] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [pastConversationsOpen, setPastConversationsOpen] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const copyResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const buttonRenderStartRef = useRef<number | null>(null);
 
   const activeConversation = useMemo(
     () =>
@@ -67,10 +69,25 @@ export const ConversationPanel = ({
     [activeConversationId, conversations],
   );
 
-  const isProcessing = useMemo(
-    () => messages.some((message) => message.status === "processing"),
-    [messages],
-  );
+  const currentAssistantMessage = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role === "assistant") {
+        return message;
+      }
+    }
+    return null;
+  }, [messages]);
+
+  const currentAssistantStatus = currentAssistantMessage?.status ?? null;
+  const isProcessing = currentAssistantStatus === "processing";
+  const showCancel = isProcessing || sending;
+  const canCancel = showCancel && !cancelling;
+  const canSend = !showCancel && !cancelling && Boolean(input.trim());
+
+  if (typeof performance !== "undefined") {
+    buttonRenderStartRef.current = performance.now();
+  }
 
   const lastAssistantMessageId = useMemo(() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -195,12 +212,6 @@ export const ConversationPanel = ({
   }, [activeConversation?.id, loadMessages, projectId]);
 
   const handleSubmit = useCallback(async () => {
-    if (isProcessing && !input.trim()) {
-      await handleCancel();
-      setInput("");
-      return;
-    }
-
     const message = input.trim();
     if (!message) return;
 
@@ -244,13 +255,55 @@ export const ConversationPanel = ({
     activeConversation?.id,
     aiModel,
     aiProvider,
-    handleCancel,
     handleCreateConversation,
     input,
-    isProcessing,
     loadConversations,
     loadMessages,
   ]);
+
+  const handlePrimaryAction = useCallback(async () => {
+    if (showCancel) {
+      if (!canCancel) return;
+      console.log("[ConversationPanel] Cancel click", {
+        conversationId: activeConversation?.id ?? null,
+        projectId,
+      });
+      setSending(false);
+      setCancelling(true);
+      try {
+        await handleCancel();
+        setInput("");
+      } finally {
+        setCancelling(false);
+      }
+      return;
+    }
+
+    if (!canSend) return;
+    console.log("[ConversationPanel] Send click", {
+      conversationId: activeConversation?.id ?? null,
+      projectId,
+    });
+    await handleSubmit();
+  }, [
+    activeConversation?.id,
+    canCancel,
+    canSend,
+    handleCancel,
+    handleSubmit,
+    projectId,
+    showCancel,
+  ]);
+
+  useEffect(() => {
+    if (typeof performance === "undefined") return;
+    if (buttonRenderStartRef.current === null) return;
+    const durationMs = performance.now() - buttonRenderStartRef.current;
+    console.log(
+      `[ConversationPanel] ${showCancel ? "Cancel" : "Send"} button render: ${durationMs.toFixed(2)}ms`,
+      { disabled: showCancel ? !canCancel : !canSend },
+    );
+  }, [canCancel, canSend, showCancel]);
 
   const handleCopyMessage = useCallback(async (message: ConversationMessage) => {
     try {
@@ -331,7 +384,7 @@ export const ConversationPanel = ({
                       : "bg-muted text-foreground",
                   )}
                 >
-                  {message.status === "processing" || !message.content ? (
+                  {message.status === "processing" ? (
                     <div className="flex items-center gap-2 text-muted-foreground">
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                       <span>Thinking...</span>
@@ -382,11 +435,11 @@ export const ConversationPanel = ({
             onChange={(event) => setInput(event.target.value)}
             placeholder="Ask about this project..."
             rows={3}
-            disabled={sending}
+            disabled={showCancel}
             onKeyDown={(event) => {
               if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
                 event.preventDefault();
-                void handleSubmit();
+                void handlePrimaryAction();
               }
             }}
           />
@@ -399,14 +452,14 @@ export const ConversationPanel = ({
             <Button
               type="button"
               size="sm"
-              variant={isProcessing && !input.trim() ? "outline" : "default"}
-              onClick={handleSubmit}
-              disabled={sending || (!input.trim() && !isProcessing)}
+              variant={showCancel ? "outline" : "default"}
+              onClick={handlePrimaryAction}
+              disabled={showCancel ? !canCancel : !canSend}
             >
-              {isProcessing && !input.trim() ? (
+              {showCancel ? (
                 <>
                   <Square className="size-3.5" />
-                  Stop
+                  Cancel
                 </>
               ) : (
                 <>

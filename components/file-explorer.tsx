@@ -627,7 +627,7 @@ export function FileExplorer({ projectId, onOpenFile }: FileExplorerProps) {
       ) : error ? (
         <div className="text-sm text-destructive">{error}</div>
       ) : (
-        <div className="min-h-[200px]">
+        <div className="min-h-50">
           {tree.length === 0 ? (
             <div className="text-sm text-muted-foreground px-2 py-1">
               No files yet. Create your first file or folder.
