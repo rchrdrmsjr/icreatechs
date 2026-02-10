@@ -1,7 +1,7 @@
 import { inngest } from "./client";
 import { google } from "@ai-sdk/google";
 import { groq } from "@ai-sdk/groq";
-import { generateText, stepCountIs } from "ai";
+import { generateText, stepCountIs, streamText } from "ai";
 import { NonRetriableError } from "inngest";
 import { firecrawl } from "@/lib/firecrawl";
 import { createTelemetryConfig } from "@/lib/telemetry-config";
@@ -9,6 +9,7 @@ import { createAdminClient } from "@/utils/supabase/admin";
 import { cache } from "@/lib/redis";
 import {
   CODING_AGENT_SYSTEM_PROMPT,
+  NEUTRAL_ASSISTANT_SYSTEM_PROMPT,
   TITLE_GENERATOR_SYSTEM_PROMPT,
 } from "@/inngest/agent/constants";
 import {
@@ -324,6 +325,19 @@ const GROQ_MODELS = new Set([
 ]);
 
 const DEFAULT_CONVERSATION_TITLE = "New conversation";
+const INTENT_VERB_REGEX =
+  /\b(create|add|update|edit|delete|rename|refactor|implement|scaffold)\b/i;
+const FILE_MUTATION_TOOLS = new Set([
+  "createFile",
+  "createFiles",
+  "createFolder",
+  "updateFile",
+  "renameFile",
+  "deleteFile",
+  "deleteRecursive",
+]);
+const FILE_CLAIM_REGEX =
+  /\b(?:i|we)\b[^.!?]*\b(created|added|updated|modified|deleted|renamed|scaffolded|implemented|wrote)\b/i;
 
 type ConversationMessageEvent = {
   messageId: string;
@@ -358,6 +372,48 @@ const extractTextFromSteps = (steps: unknown) => {
   }
 
   return "";
+};
+
+const extractToolNamesFromSteps = (steps: unknown) => {
+  const toolNames = new Set<string>();
+
+  if (!Array.isArray(steps)) {
+    return toolNames;
+  }
+
+  for (const step of steps) {
+    if (!step || typeof step !== "object") {
+      continue;
+    }
+
+    const content = (step as { content?: unknown }).content;
+    if (!Array.isArray(content)) {
+      continue;
+    }
+
+    for (const item of content) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+
+      const toolName = (item as { toolName?: unknown }).toolName;
+      if (typeof toolName === "string") {
+        toolNames.add(toolName);
+      }
+    }
+  }
+
+  return toolNames;
+};
+
+const stripFileClaims = (text: string) => {
+  if (!text.trim()) {
+    return text;
+  }
+
+  const sentences = text.split(/(?<=[.!?])\s+/);
+  const filtered = sentences.filter((sentence) => !FILE_CLAIM_REGEX.test(sentence));
+  return filtered.join(" ").trim();
 };
 
 export const processMessage = inngest.createFunction(
@@ -411,6 +467,21 @@ export const processMessage = inngest.createFunction(
           })
           .eq("id", messageId)
           .eq("status", "processing");
+      });
+
+      await step.run("notify-stream-error", async () => {
+        if (!conversationId) return;
+        try {
+          await cache.publish(`stream:conversation:${conversationId}`, {
+            type: "error",
+            messageId,
+            conversationId,
+            projectId,
+            error: failureMessage,
+          });
+        } catch (cacheError) {
+          console.warn("[processMessage] stream error publish failed", cacheError);
+        }
       });
 
       await step.run("invalidate-cache", async () => {
@@ -494,12 +565,17 @@ export const processMessage = inngest.createFunction(
       .map((msg) => `${msg.role.toUpperCase()}: ${msg.content}`)
       .join("\n\n");
 
-    let systemPrompt = CODING_AGENT_SYSTEM_PROMPT;
+    const wantsCodeChanges = INTENT_VERB_REGEX.test(message);
+    let systemPrompt = wantsCodeChanges
+      ? CODING_AGENT_SYSTEM_PROMPT
+      : NEUTRAL_ASSISTANT_SYSTEM_PROMPT;
     if (historyText) {
       systemPrompt += `\n\n## Previous Conversation (for context only - do NOT repeat these responses):\n${historyText}\n\n## Current Request:\nRespond ONLY to the user's new message below. Do not repeat or reference your previous responses.`;
     }
-    systemPrompt +=
-      "\n\nIf you need a fresh view of the codebase, call syncCodebaseIndex before making changes.";
+    if (wantsCodeChanges) {
+      systemPrompt +=
+        "\n\nIf you need a fresh view of the codebase, call syncCodebaseIndex before making changes.";
+    }
 
     if (conversation?.title === DEFAULT_CONVERSATION_TITLE) {
       const title = await step.run("generate-title", async () => {
@@ -556,68 +632,127 @@ export const processMessage = inngest.createFunction(
       }),
     };
 
+    const streamChannel = `stream:conversation:${conversationId}`;
+    const publishStreamEvent = async (payload: Record<string, unknown>) => {
+      try {
+        await cache.publish(streamChannel, payload);
+      } catch (error) {
+        console.warn("[processMessage] stream publish failed", error);
+      }
+    };
+
     const generateResult = await step.run("generate-response", async () => {
-      return await generateText({
+      const stream = streamText({
         model: provider === "groq" ? groq(selectedModel) : google(selectedModel),
         system: systemPrompt,
         prompt: message,
-        tools,
+        tools: wantsCodeChanges ? tools : undefined,
         stopWhen: stepCountIs(12),
         temperature: 0.3,
         experimental_telemetry: createTelemetryConfig(
           provider === "groq" ? "groq-conversation" : "gemini-conversation",
         ),
       });
+
+      let streamedText = "";
+      let sequence = 0;
+
+      for await (const delta of stream.textStream) {
+        streamedText += delta;
+        sequence += 1;
+        await publishStreamEvent({
+          type: "token",
+          messageId,
+          conversationId,
+          projectId,
+          delta,
+          sequence,
+          provider,
+          model: selectedModel,
+        });
+      }
+
+      const [usage, totalUsage, steps] = await Promise.all([
+        stream.usage,
+        stream.totalUsage,
+        stream.steps,
+      ]);
+
+      return { streamedText, usage, totalUsage, steps };
     });
 
     const {
-      text,
       usage,
       totalUsage,
       steps,
+      streamedText,
     } = (generateResult ?? {}) as {
-      text?: unknown;
-      usage?: { totalTokens?: number };
-      totalUsage?: { totalTokens?: number };
+      streamedText?: string;
+      usage?: { inputTokens?: number; outputTokens?: number };
+      totalUsage?: { inputTokens?: number; outputTokens?: number };
       steps?: unknown;
     };
-    const outputText =
-      generateResult &&
-      typeof (generateResult as { _output?: unknown })._output === "string"
-        ? (generateResult as { _output: string })._output
-        : "";
-    const primaryText = typeof text === "string" ? text : "";
     const stepText = extractTextFromSteps(steps);
+    const toolNames = extractToolNamesFromSteps(steps);
+    const ranFileMutationTool = Array.from(toolNames).some((toolName) =>
+      FILE_MUTATION_TOOLS.has(toolName),
+    );
     console.log("[processMessage] generate-response output", {
       messageId,
       conversationId,
       provider,
       model: selectedModel,
-      hasText: Boolean(primaryText.trim()),
-      hasOutput: Boolean(outputText.trim()),
+      hasStream: Boolean((streamedText ?? "").trim()),
       stepsCount: Array.isArray(steps) ? steps.length : 0,
       stepTextLength: stepText.length,
-      outputTextLength: outputText.length,
+      streamedTextLength: streamedText?.length ?? 0,
+      ranFileMutationTool,
     });
-    const responseText =
-      primaryText.trim() ||
-      outputText.trim() ||
+    let responseText =
+      (streamedText ?? "").trim() ||
       stepText.trim() ||
       "I processed your request. Let me know if you need anything else.";
+    if (!ranFileMutationTool) {
+      const cleaned = stripFileClaims(responseText);
+      if (cleaned.trim() !== responseText.trim()) {
+        responseText = cleaned.trim();
+        if (!responseText) {
+          responseText =
+            "No files were changed. If you want me to modify files, please say so.";
+        }
+      }
+    }
 
     await step.run("update-assistant-message", async () => {
+      const totalTokens =
+        typeof totalUsage?.inputTokens === "number" ||
+        typeof totalUsage?.outputTokens === "number"
+          ? (totalUsage?.inputTokens ?? 0) + (totalUsage?.outputTokens ?? 0)
+          : typeof usage?.inputTokens === "number" ||
+              typeof usage?.outputTokens === "number"
+            ? (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0)
+            : null;
       await supabase
         .from("messages")
         .update({
-            content: responseText,
-            status: "completed",
-            model: selectedModel,
-            tokens_used: totalUsage?.totalTokens ?? usage?.totalTokens ?? null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", messageId)
-          .eq("status", "processing");
-      });
+          content: responseText,
+          status: "completed",
+          model: selectedModel,
+          tokens_used: totalTokens,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", messageId)
+        .eq("status", "processing");
+    });
+
+    await publishStreamEvent({
+      type: "done",
+      messageId,
+      conversationId,
+      projectId,
+      provider,
+      model: selectedModel,
+    });
 
     await step.run("touch-conversation", async () => {
       await supabase
