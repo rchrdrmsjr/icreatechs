@@ -1,15 +1,32 @@
 import { inngest } from "./client";
 import { google } from "@ai-sdk/google";
 import { groq } from "@ai-sdk/groq";
-import { generateText } from "ai";
+import { generateText, stepCountIs } from "ai";
 import { NonRetriableError } from "inngest";
 import { firecrawl } from "@/lib/firecrawl";
-import {
-  trackInngestError,
-  trackExternalServiceError,
-} from "@/lib/error-tracking";
 import { createTelemetryConfig } from "@/lib/telemetry-config";
 import { createAdminClient } from "@/utils/supabase/admin";
+import {
+  CODING_AGENT_SYSTEM_PROMPT,
+  TITLE_GENERATOR_SYSTEM_PROMPT,
+} from "@/inngest/agent/constants";
+import {
+  createCreateFilesTool,
+  createCreateFileTool,
+  createCreateFolderTool,
+  createDeleteFileTool,
+  createDeleteRecursiveTool,
+  createExistingFilesTool,
+  createGetFileByIdTool,
+  createGetProjectsFilesTool,
+  createGetRecentMessagesTool,
+  createListFilesTool,
+  createReadFilesTool,
+  createRenameFileTool,
+  createSyncCodebaseIndexTool,
+  createUpdateConversationTitleTool,
+  createUpdateFileTool,
+} from "@/inngest/agent/tools";
 
 export const helloWorld = inngest.createFunction(
   { id: "hello-world" },
@@ -305,16 +322,7 @@ const GROQ_MODELS = new Set([
   "llama-3.1-8b-instant",
 ]);
 
-const DEFAULT_CONVERSATION_SYSTEM_PROMPT = [
-  "You are an expert AI coding assistant for iCreateTechs.",
-  "Be direct, practical, and action-oriented.",
-  "When giving code, keep it concise and explain key changes.",
-  "If you need clarification, ask a single focused question.",
-].join("\n");
-
 const DEFAULT_CONVERSATION_TITLE = "New conversation";
-const TITLE_GENERATOR_PROMPT =
-  "Generate a short, descriptive title (3-6 words) for this conversation. Return ONLY the title.";
 
 type ConversationMessageEvent = {
   messageId: string;
@@ -323,6 +331,32 @@ type ConversationMessageEvent = {
   message: string;
   aiProvider?: "gemini" | "groq";
   model?: string | null;
+};
+
+const extractTextFromSteps = (steps: unknown) => {
+  if (!Array.isArray(steps)) {
+    return "";
+  }
+
+  for (let stepIndex = steps.length - 1; stepIndex >= 0; stepIndex -= 1) {
+    const step = steps[stepIndex] as { content?: unknown };
+    if (!Array.isArray(step?.content)) {
+      continue;
+    }
+
+    const content = step.content as Array<{ type?: unknown; text?: unknown }>;
+    for (let contentIndex = content.length - 1; contentIndex >= 0; contentIndex -= 1) {
+      const item = content[contentIndex];
+      if (item?.type === "text" && typeof item.text === "string") {
+        return item.text;
+      }
+      if (typeof item?.text === "string") {
+        return item.text;
+      }
+    }
+  }
+
+  return "";
 };
 
 export const processMessage = inngest.createFunction(
@@ -334,12 +368,33 @@ export const processMessage = inngest.createFunction(
         if: "event.data.messageId == async.data.messageId",
       },
     ],
-    onFailure: async ({ event, step }) => {
+    onFailure: async (context) => {
+      const { event, step } = context;
+      const error = (context as { error?: unknown }).error;
       const originalEvent = event.data.event as { data?: ConversationMessageEvent };
       const messageId = originalEvent?.data?.messageId;
 
       if (!messageId) {
         return;
+      }
+
+      const errorMessage = error instanceof Error ? error.message : "";
+      const normalized = errorMessage.toLowerCase();
+      let failureMessage =
+        "Sorry, I ran into an error while processing that request. Please try again.";
+
+      if (
+        normalized.includes("quota") ||
+        normalized.includes("rate limit") ||
+        normalized.includes("billing")
+      ) {
+        failureMessage =
+          "AI provider quota exceeded. Check billing or switch providers.";
+      } else if (
+        normalized.includes("api key") ||
+        normalized.includes("not configured")
+      ) {
+        failureMessage = "AI provider API key is missing or invalid.";
       }
 
       const supabase = createAdminClient();
@@ -348,11 +403,11 @@ export const processMessage = inngest.createFunction(
           .from("messages")
           .update({
             status: "failed",
-            content:
-              "Sorry, I ran into an error while processing that request. Please try again.",
+            content: failureMessage,
             updated_at: new Date().toISOString(),
           })
-          .eq("id", messageId);
+          .eq("id", messageId)
+          .eq("status", "processing");
       });
     },
   },
@@ -424,25 +479,38 @@ export const processMessage = inngest.createFunction(
       .map((msg) => `${msg.role.toUpperCase()}: ${msg.content}`)
       .join("\n\n");
 
-    const prompt = [
-      DEFAULT_CONVERSATION_SYSTEM_PROMPT,
-      historyText ? `\n\n## Conversation History\n${historyText}` : "",
-      `\n\n## User Message\n${message}`,
-    ]
-      .join("")
-      .trim();
+    let systemPrompt = CODING_AGENT_SYSTEM_PROMPT;
+    if (historyText) {
+      systemPrompt += `\n\n## Previous Conversation (for context only - do NOT repeat these responses):\n${historyText}\n\n## Current Request:\nRespond ONLY to the user's new message below. Do not repeat or reference your previous responses.`;
+    }
+    systemPrompt +=
+      "\n\nIf you need a fresh view of the codebase, call syncCodebaseIndex before making changes.";
 
     if (conversation?.title === DEFAULT_CONVERSATION_TITLE) {
-      const { text } = await step.run("generate-title", async () => {
-        return await generateText({
-          model: google("gemini-2.0-flash"),
-          prompt: `${TITLE_GENERATOR_PROMPT}\n\nMessage:\n${message}`,
-          temperature: 0,
-          experimental_telemetry: createTelemetryConfig("gemini-title-generator"),
-        });
+      const title = await step.run("generate-title", async () => {
+        try {
+          const { text } = await generateText({
+            model:
+              provider === "groq"
+                ? groq("llama-3.1-8b-instant")
+                : google("gemini-2.0-flash"),
+            system: TITLE_GENERATOR_SYSTEM_PROMPT,
+            prompt: message,
+            temperature: 0,
+            experimental_telemetry: createTelemetryConfig(
+              provider === "groq"
+                ? "groq-title-generator"
+                : "gemini-title-generator",
+            ),
+          });
+
+          return text.trim().replace(/^"|"$/g, "");
+        } catch (error) {
+          console.error("Failed to generate conversation title", error);
+          return null;
+        }
       });
 
-      const title = text.trim().replace(/^"|"$/g, "");
       if (title) {
         await step.run("update-conversation-title", async () => {
           await supabase
@@ -453,35 +521,75 @@ export const processMessage = inngest.createFunction(
       }
     }
 
-    const { text, usage } = await step.run("generate-response", async () => {
+    const tools = {
+      listFiles: createListFilesTool({ projectId }),
+      syncCodebaseIndex: createSyncCodebaseIndexTool({ projectId }),
+      readFiles: createReadFilesTool({ projectId }),
+      createFile: createCreateFileTool({ projectId }),
+      createFiles: createCreateFilesTool({ projectId }),
+      createFolder: createCreateFolderTool({ projectId }),
+      updateFile: createUpdateFileTool({ projectId }),
+      renameFile: createRenameFileTool({ projectId }),
+      deleteFile: createDeleteFileTool({ projectId }),
+      deleteRecursive: createDeleteRecursiveTool({ projectId }),
+      existingFiles: createExistingFilesTool({ projectId }),
+      getProjectsFiles: createGetProjectsFilesTool({ projectId }),
+      getFileById: createGetFileByIdTool({ projectId }),
+      getRecentMessages: createGetRecentMessagesTool({ conversationId }),
+      updateConversationTitle: createUpdateConversationTitleTool({
+        conversationId,
+      }),
+    };
+
+    const { text, usage, totalUsage, steps } = await step.run(
+      "generate-response",
+      async () => {
       return await generateText({
         model:
           provider === "groq"
             ? groq(selectedModel)
             : google(selectedModel),
-        prompt,
+        system: systemPrompt,
+        prompt: message,
+        tools,
+        stopWhen: stepCountIs(12),
         temperature: 0.3,
         experimental_telemetry: createTelemetryConfig(
           provider === "groq" ? "groq-conversation" : "gemini-conversation",
         ),
       });
-    });
+    },
+    );
 
-    const responseText = text.trim() ||
+    const primaryText = typeof text === "string" ? text : "";
+    const stepText = extractTextFromSteps(steps);
+    console.log("[processMessage] generate-response output", {
+      messageId,
+      conversationId,
+      provider,
+      model: selectedModel,
+      hasText: Boolean(primaryText.trim()),
+      stepsCount: Array.isArray(steps) ? steps.length : 0,
+      stepTextLength: stepText.length,
+    });
+    const responseText =
+      primaryText.trim() ||
+      stepText.trim() ||
       "I processed your request. Let me know if you need anything else.";
 
     await step.run("update-assistant-message", async () => {
       await supabase
         .from("messages")
         .update({
-          content: responseText,
-          status: "completed",
-          model: selectedModel,
-          tokens_used: usage?.totalTokens ?? null,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", messageId);
-    });
+            content: responseText,
+            status: "completed",
+            model: selectedModel,
+            tokens_used: totalUsage?.totalTokens ?? usage?.totalTokens ?? null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", messageId)
+          .eq("status", "processing");
+      });
 
     await step.run("touch-conversation", async () => {
       await supabase

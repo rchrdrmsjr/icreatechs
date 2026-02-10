@@ -15,6 +15,7 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import { PastConversationsDialog } from "@/components/conversations/past-conversations-dialog";
 
@@ -57,9 +58,14 @@ export const ConversationPanel = ({
   const [cancelling, setCancelling] = useState(false);
   const [pastConversationsOpen, setPastConversationsOpen] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] =
+    useState<ConversationPanelProps["aiProvider"]>(aiProvider);
+  const [selectedModel, setSelectedModel] = useState<string | undefined>(aiModel);
   const scrollRef = useRef<HTMLDivElement>(null);
   const copyResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const buttonRenderStartRef = useRef<number | null>(null);
+  const lastFailureIdRef = useRef<string | null>(null);
+  const wasProcessingRef = useRef(false);
 
   const activeConversation = useMemo(
     () =>
@@ -156,6 +162,62 @@ export const ConversationPanel = ({
       setMessages([]);
     }
   }, [activeConversation?.id, loadMessages]);
+
+  useEffect(() => {
+    setSelectedProvider(aiProvider);
+  }, [aiProvider]);
+
+  useEffect(() => {
+    setSelectedModel(aiModel);
+  }, [aiModel]);
+
+  useEffect(() => {
+    if (!activeConversation?.id || !isProcessing) return;
+    const interval = setInterval(() => {
+      void loadMessages(activeConversation.id, true);
+    }, 1500);
+    return () => clearInterval(interval);
+  }, [activeConversation?.id, isProcessing, loadMessages]);
+
+  useEffect(() => {
+    if (wasProcessingRef.current && !isProcessing) {
+      if (activeConversation?.id) {
+        void loadMessages(activeConversation.id, true);
+      }
+      void loadConversations();
+    }
+    wasProcessingRef.current = isProcessing;
+  }, [activeConversation?.id, isProcessing, loadConversations, loadMessages]);
+
+  useEffect(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "assistant" || message.status !== "failed") {
+        continue;
+      }
+
+      if (lastFailureIdRef.current === message.id) {
+        break;
+      }
+
+      lastFailureIdRef.current = message.id;
+      const content = message.content?.trim();
+      const normalized = (content ?? "").toLowerCase();
+      if (
+        normalized.includes("quota") ||
+        normalized.includes("rate limit") ||
+        normalized.includes("billing")
+      ) {
+        toast.error(
+          content ||
+            "AI provider quota exceeded. Check billing or switch providers.",
+        );
+      } else {
+        toast.error(content || "Message failed. Please try again.");
+      }
+      break;
+    }
+  }, [messages]);
 
   useEffect(() => {
     return () => {
@@ -255,8 +317,8 @@ export const ConversationPanel = ({
         body: JSON.stringify({
           conversationId,
           message,
-          aiProvider,
-          model: aiModel ?? null,
+          aiProvider: selectedProvider,
+          model: selectedModel ?? null,
         }),
       });
       const payload = await response.json();
@@ -275,12 +337,12 @@ export const ConversationPanel = ({
     }
   }, [
     activeConversation?.id,
-    aiModel,
-    aiProvider,
     handleCreateConversation,
     input,
     loadConversations,
     loadMessages,
+    selectedModel,
+    selectedProvider,
   ]);
 
   const handlePrimaryAction = useCallback(async () => {
@@ -360,6 +422,26 @@ export const ConversationPanel = ({
           </span>
         </div>
         <div className="flex items-center gap-2">
+          <ToggleGroup
+            type="single"
+            size="sm"
+            variant="outline"
+            value={selectedProvider ?? "gemini"}
+            onValueChange={(value) => {
+              if (!value) return;
+              const provider = value as ConversationPanelProps["aiProvider"];
+              setSelectedProvider(provider);
+              setSelectedModel(undefined);
+            }}
+            disabled={showCancel}
+          >
+            <ToggleGroupItem value="gemini" aria-label="Use Gemini">
+              Gemini
+            </ToggleGroupItem>
+            <ToggleGroupItem value="groq" aria-label="Use Groq">
+              Groq
+            </ToggleGroupItem>
+          </ToggleGroup>
           <Button
             size="icon-xs"
             variant="ghost"
@@ -417,7 +499,8 @@ export const ConversationPanel = ({
                     </span>
                   ) : message.status === "failed" ? (
                     <span className="text-destructive">
-                      Something went wrong. Try again.
+                      {message.content?.trim() ||
+                        "Something went wrong. Try again."}
                     </span>
                   ) : message.role === "assistant" ? (
                     <div className="prose prose-invert prose-sm max-w-none">

@@ -3,10 +3,10 @@ import { cookies } from "next/headers";
 import * as Sentry from "@sentry/nextjs";
 
 import { createClient } from "@/utils/supabase/server";
+import { createAdminClient } from "@/utils/supabase/admin";
+import { inngest } from "@/inngest/client";
 
 export const dynamic = "force-dynamic";
-
-const AI_REQUEST_TIMEOUT_MS = 20000;
 
 type MessagePayload = {
   conversationId: string;
@@ -75,14 +75,16 @@ export async function POST(request: NextRequest) {
           );
         }
 
-        const { data: processingMessages } = await supabase
+        const adminClient = createAdminClient();
+
+        const { data: processingMessages } = await adminClient
           .from("messages")
           .select("id")
           .eq("conversation_id", conversationId)
           .eq("status", "processing");
 
         if (processingMessages && processingMessages.length > 0) {
-          await supabase
+          await adminClient
             .from("messages")
             .update({ status: "cancelled", updated_at: new Date().toISOString() })
             .in(
@@ -91,7 +93,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        const { error: userMessageError } = await supabase.from("messages").insert({
+        const { error: userMessageError } = await adminClient.from("messages").insert({
           conversation_id: conversationId,
           role: "user",
           content: message,
@@ -101,12 +103,15 @@ export async function POST(request: NextRequest) {
         if (userMessageError) {
           Sentry.captureException(userMessageError);
           return NextResponse.json(
-            { error: "Failed to save user message" },
+            {
+              error: "Failed to save user message",
+              details: userMessageError.message,
+            },
             { status: 500 },
           );
         }
 
-        const { data: assistantMessage, error: assistantError } = await supabase
+        const { data: assistantMessage, error: assistantError } = await adminClient
           .from("messages")
           .insert({
             conversation_id: conversationId,
@@ -127,64 +132,22 @@ export async function POST(request: NextRequest) {
 
         assistantMessageId = assistantMessage.id;
 
-        await supabase
+        await adminClient
           .from("conversations")
           .update({ updated_at: new Date().toISOString() })
           .eq("id", conversationId);
 
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
-
-        let aiPayload: unknown;
-        let aiResponse: Response;
-
-        try {
-          aiResponse = await fetch(new URL("/api/demo/blocking", request.url), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ prompt: message }),
-            signal: controller.signal,
-          });
-
-          aiPayload = await aiResponse.json();
-        } catch (error) {
-          if (error instanceof Error && error.name === "AbortError") {
-            throw new Error("AI request timed out");
-          }
-          throw error;
-        } finally {
-          clearTimeout(timeoutId);
-        }
-
-        if (!aiResponse.ok) {
-          const payload = aiPayload as { error?: string } | null;
-          throw new Error(payload?.error ?? "AI request failed");
-        }
-
-        const payloadData = aiPayload as {
-          data?: { text?: string; response?: string; model?: string; usage?: { totalTokens?: number } };
-        };
-
-        const responseText =
-          payloadData?.data?.text ??
-          payloadData?.data?.response ??
-          "I processed your request. Let me know if you need anything else.";
-
-        const { error: updateError } = await supabase
-          .from("messages")
-          .update({
-            content: responseText,
-            status: "completed",
-            model: payloadData?.data?.model ?? null,
-            tokens_used: payloadData?.data?.usage?.totalTokens ?? null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq("id", assistantMessageId)
-          .eq("status", "processing");
-
-        if (updateError) {
-          throw updateError;
-        }
+        await inngest.send({
+          name: "message/sent",
+          data: {
+            messageId: assistantMessageId,
+            conversationId,
+            projectId: conversation.project_id,
+            message,
+            aiProvider: body.aiProvider ?? "gemini",
+            model: body.model ?? null,
+          },
+        });
 
         return NextResponse.json({
           success: true,
@@ -192,14 +155,15 @@ export async function POST(request: NextRequest) {
         });
       } catch (error) {
         if (assistantMessageId) {
-          const { data: currentMessage } = await supabase
+          const adminClient = createAdminClient();
+          const { data: currentMessage } = await adminClient
             .from("messages")
             .select("status")
             .eq("id", assistantMessageId)
             .maybeSingle();
 
           if (currentMessage?.status !== "cancelled") {
-            await supabase
+            await adminClient
               .from("messages")
               .update({
                 status: "failed",
