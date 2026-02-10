@@ -5,6 +5,7 @@ import * as Sentry from "@sentry/nextjs";
 import { createClient } from "@/utils/supabase/server";
 import { createAdminClient } from "@/utils/supabase/admin";
 import { inngest } from "@/inngest/client";
+import { cache } from "@/lib/redis";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +24,7 @@ export async function POST(request: NextRequest) {
       name: "POST /api/messages",
     },
     async () => {
-      const cookieStore = cookies();
+      const cookieStore = await cookies();
       const supabase = createClient(cookieStore);
       let assistantMessageId: string | null = null;
 
@@ -136,6 +137,21 @@ export async function POST(request: NextRequest) {
           .from("conversations")
           .update({ updated_at: new Date().toISOString() })
           .eq("id", conversationId);
+
+        try {
+          await Promise.all([
+            cache.del(`messages:conversation:${conversationId}`),
+            cache.del(`conversations:project:${conversation.project_id}`),
+          ]);
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: {
+              operation: "messages_cache_invalidate",
+              conversationId,
+              projectId: conversation.project_id,
+            },
+          });
+        }
 
         await inngest.send({
           name: "message/sent",

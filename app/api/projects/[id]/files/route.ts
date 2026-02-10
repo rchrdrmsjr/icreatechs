@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 import { createClient } from "@/utils/supabase/server";
 import { createAdminClient } from "@/utils/supabase/admin";
 import * as Sentry from "@sentry/nextjs";
+import { cache } from "@/lib/redis";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +28,7 @@ export async function GET(
     async () => {
       try {
         const { id } = await params;
-        const cookieStore = cookies();
+        const cookieStore = await cookies();
         const supabase = createClient(cookieStore);
 
         const {
@@ -71,6 +72,18 @@ export async function GET(
           );
         }
 
+        const cacheKey = `project-files:${id}`;
+        try {
+          const cached = await cache.get(cacheKey);
+          if (cached) {
+            return NextResponse.json({ files: cached, cached: true });
+          }
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "project_files_cache_get", projectId: id },
+          });
+        }
+
         const { data: files, error: filesError } = await supabase
           .from("files")
           .select("id, name, type, parent_id, path")
@@ -83,6 +96,14 @@ export async function GET(
             { error: "Failed to fetch files", details: filesError.message },
             { status: 500 },
           );
+        }
+
+        try {
+          await cache.set(cacheKey, files ?? [], 60);
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "project_files_cache_set", projectId: id },
+          });
         }
 
         return NextResponse.json({ files: files || [] });
@@ -110,7 +131,7 @@ export async function POST(
     async () => {
       try {
         const { id } = await params;
-        const cookieStore = cookies();
+        const cookieStore = await cookies();
         const supabase = createClient(cookieStore);
 
         const {
@@ -245,6 +266,14 @@ export async function POST(
             { error: "Failed to create file", details: createError.message },
             { status },
           );
+        }
+
+        try {
+          await cache.del(`project-files:${id}`);
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "project_files_cache_invalidate", projectId: id },
+          });
         }
 
         return NextResponse.json({ file }, { status: 201 });

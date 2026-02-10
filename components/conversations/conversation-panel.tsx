@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ChangeEvent, KeyboardEvent, SyntheticEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -18,6 +19,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import { PastConversationsDialog } from "@/components/conversations/past-conversations-dialog";
+import { useEditorStore } from "@/lib/editor-store";
 
 type ConversationSummary = {
   id: string;
@@ -36,6 +38,14 @@ type ConversationMessage = {
   model?: string | null;
 };
 
+type FileRecord = {
+  id: string;
+  name: string;
+  path: string;
+  type: "file" | "folder";
+  parent_id: string | null;
+};
+
 interface ConversationPanelProps {
   projectId: string;
   aiProvider?: "gemini" | "groq";
@@ -43,6 +53,146 @@ interface ConversationPanelProps {
 }
 
 const DEFAULT_CONVERSATION_TITLE = "New conversation";
+
+type MentionInfo = {
+  start: number;
+  end: number;
+  trigger: "@" | "/";
+  query: string;
+};
+
+const getLanguageFromName = (name: string) => {
+  const ext = name.split(".").pop()?.toLowerCase();
+  switch (ext) {
+    case "ts":
+      return "typescript";
+    case "tsx":
+      return "typescript";
+    case "js":
+      return "javascript";
+    case "jsx":
+      return "javascript";
+    case "json":
+      return "json";
+    case "html":
+      return "html";
+    case "css":
+    case "scss":
+    case "sass":
+      return "scss";
+    case "md":
+    case "mdx":
+      return "markdown";
+    case "py":
+      return "python";
+    case "go":
+      return "go";
+    case "rs":
+      return "rust";
+    case "java":
+      return "java";
+    case "cs":
+      return "csharp";
+    case "cpp":
+    case "c":
+    case "h":
+      return "cpp";
+    case "xml":
+      return "xml";
+    default:
+      return "plaintext";
+  }
+};
+
+const stripTrailingPunctuation = (value: string) => {
+  const match = /^(.*?)([.,!?;:]+)?$/.exec(value);
+  if (!match) return { base: value, trailing: "" };
+  return { base: match[1], trailing: match[2] ?? "" };
+};
+
+const findMentionAtCursor = (value: string, cursor: number): MentionInfo | null => {
+  const left = value.slice(0, cursor);
+  const match = /(^|\s)([@/])([^\s]*)$/.exec(left);
+  if (!match) return null;
+
+  const trigger = match[2] as "@" | "/";
+  const query = match[3] ?? "";
+  const leading = match[1] ?? "";
+  const triggerIndex = left.length - match[0].length + leading.length;
+
+  return {
+    start: triggerIndex,
+    end: cursor,
+    trigger,
+    query,
+  };
+};
+
+const linkifyMentions = (
+  value: string,
+  filesByPath: Map<string, FileRecord>,
+): string => {
+  if (!value) return value;
+  const parts = value.split(/(```[\s\S]*?```)/g);
+  return parts
+    .map((part) => {
+      if (part.startsWith("```")) return part;
+      return part.replace(/(^|[\s(])([@/])([^\s)]+)/g, (match, prefix, trigger, rawPath) => {
+        const { base, trailing } = stripTrailingPunctuation(rawPath);
+        const file = filesByPath.get(base);
+        if (!file || file.type !== "file") return match;
+        return `${prefix}[${trigger}${base}](file:${file.id})${trailing}`;
+      });
+    })
+    .join("");
+};
+
+const tokenizeMentions = (
+  value: string,
+  filesByPath: Map<string, FileRecord>,
+): Array<
+  | { type: "text"; value: string }
+  | { type: "mention"; label: string; file: FileRecord }
+> => {
+  if (!value) return [{ type: "text", value: "" }];
+  const tokens: Array<
+    | { type: "text"; value: string }
+    | { type: "mention"; label: string; file: FileRecord }
+  > = [];
+  const regex = /(^|[\s(])([@/])([^\s)]+)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(value)) !== null) {
+    const prefix = match[1] ?? "";
+    const trigger = match[2];
+    const rawPath = match[3];
+    const matchStart = match.index;
+    const tokenStart = matchStart + prefix.length;
+    const tokenEnd = tokenStart + trigger.length + rawPath.length;
+    const before = value.slice(lastIndex, matchStart) + prefix;
+    if (before) {
+      tokens.push({ type: "text", value: before });
+    }
+    const { base, trailing } = stripTrailingPunctuation(rawPath);
+    const file = filesByPath.get(base);
+    if (file && file.type === "file") {
+      tokens.push({ type: "mention", label: `${trigger}${base}`, file });
+      if (trailing) {
+        tokens.push({ type: "text", value: trailing });
+      }
+    } else {
+      tokens.push({ type: "text", value: `${trigger}${rawPath}` });
+    }
+    lastIndex = tokenEnd;
+  }
+
+  if (lastIndex < value.length) {
+    tokens.push({ type: "text", value: value.slice(lastIndex) });
+  }
+
+  return tokens;
+};
 
 export const ConversationPanel = ({
   projectId,
@@ -53,6 +203,9 @@ export const ConversationPanel = ({
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
+  const [fileIndex, setFileIndex] = useState<FileRecord[]>([]);
+  const [fileIndexLoading, setFileIndexLoading] = useState(false);
+  const [fileIndexError, setFileIndexError] = useState<string | null>(null);
   const [loadingConversations, setLoadingConversations] = useState(false);
   const [sending, setSending] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -61,11 +214,15 @@ export const ConversationPanel = ({
   const [selectedProvider, setSelectedProvider] =
     useState<ConversationPanelProps["aiProvider"]>(aiProvider);
   const [selectedModel, setSelectedModel] = useState<string | undefined>(aiModel);
+  const [cursorPosition, setCursorPosition] = useState(0);
+  const [mentionIndex, setMentionIndex] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const copyResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const buttonRenderStartRef = useRef<number | null>(null);
   const lastFailureIdRef = useRef<string | null>(null);
   const wasProcessingRef = useRef(false);
+  const openFile = useEditorStore((state) => state.openFile);
 
   const activeConversation = useMemo(
     () =>
@@ -151,9 +308,33 @@ export const ConversationPanel = ({
     [],
   );
 
+  const loadFileIndex = useCallback(async () => {
+    if (!projectId) return;
+    setFileIndexLoading(true);
+    setFileIndexError(null);
+    try {
+      const response = await fetch(`/api/projects/${projectId}/files`);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload?.error ?? "Failed to load project files");
+      }
+      setFileIndex(payload?.files ?? []);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to load project files";
+      setFileIndexError(message);
+    } finally {
+      setFileIndexLoading(false);
+    }
+  }, [projectId]);
+
   useEffect(() => {
     void loadConversations();
   }, [loadConversations]);
+
+  useEffect(() => {
+    void loadFileIndex();
+  }, [loadFileIndex]);
 
   useEffect(() => {
     if (activeConversation?.id) {
@@ -184,10 +365,17 @@ export const ConversationPanel = ({
       if (activeConversation?.id) {
         void loadMessages(activeConversation.id, true);
       }
+      void loadFileIndex();
       void loadConversations();
     }
     wasProcessingRef.current = isProcessing;
-  }, [activeConversation?.id, isProcessing, loadConversations, loadMessages]);
+  }, [
+    activeConversation?.id,
+    isProcessing,
+    loadConversations,
+    loadFileIndex,
+    loadMessages,
+  ]);
 
   useEffect(() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -234,6 +422,38 @@ export const ConversationPanel = ({
       behavior: "smooth",
     });
   }, [messages.length]);
+
+  const mentionInfo = useMemo(
+    () => findMentionAtCursor(input, cursorPosition),
+    [cursorPosition, input],
+  );
+
+  const mentionResults = useMemo(() => {
+    if (!mentionInfo) return [];
+    const query = mentionInfo.query.trim().toLowerCase();
+    const filtered = fileIndex.filter((file) => {
+      const path = file.path?.toLowerCase() ?? "";
+      const name = file.name?.toLowerCase() ?? "";
+      if (!query) return true;
+      return path.includes(query) || name.includes(query);
+    });
+
+    return filtered
+      .sort((a, b) => {
+        if (a.type !== b.type) {
+          return a.type === "folder" ? -1 : 1;
+        }
+        return a.path.localeCompare(b.path);
+      })
+      .slice(0, 8);
+  }, [fileIndex, mentionInfo]);
+
+  const showMentionMenu = Boolean(mentionInfo) && !showCancel;
+
+  useEffect(() => {
+    if (!mentionInfo) return;
+    setMentionIndex(0);
+  }, [mentionInfo?.query, mentionInfo?.trigger]);
 
   const handleCreateConversation = useCallback(async () => {
     try {
@@ -406,6 +626,178 @@ export const ConversationPanel = ({
     }
   }, []);
 
+  const filesByPath = useMemo(() => {
+    const map = new Map<string, FileRecord>();
+    fileIndex.forEach((file) => {
+      if (file.path) {
+        map.set(file.path, file);
+      }
+    });
+    return map;
+  }, [fileIndex]);
+
+  const handleOpenFile = useCallback(
+    (file: FileRecord) => {
+      if (file.type !== "file") return;
+      openFile({
+        id: file.id,
+        name: file.name,
+        path: file.path,
+        language: getLanguageFromName(file.name),
+      });
+    },
+    [openFile],
+  );
+
+  const handleMentionSelect = useCallback(
+    (file: FileRecord) => {
+      if (!mentionInfo) return;
+      const path = file.path || file.name;
+      const after = input.slice(mentionInfo.end);
+      const needsSpace = after.length === 0 || !/^\s/.test(after);
+      const insertion = `${mentionInfo.trigger}${path}${needsSpace ? " " : ""}`;
+      const nextValue = `${input.slice(0, mentionInfo.start)}${insertion}${after}`;
+      const nextCursor = mentionInfo.start + insertion.length;
+
+      setInput(nextValue);
+      setCursorPosition(nextCursor);
+
+      requestAnimationFrame(() => {
+        const textarea = textareaRef.current;
+        if (!textarea) return;
+        textarea.focus();
+        textarea.setSelectionRange(nextCursor, nextCursor);
+      });
+    },
+    [input, mentionInfo],
+  );
+
+  const handleInputChange = useCallback(
+    (event: ChangeEvent<HTMLTextAreaElement>) => {
+      setInput(event.target.value);
+      setCursorPosition(event.target.selectionStart ?? event.target.value.length);
+    },
+    [],
+  );
+
+  const handleCursorUpdate = useCallback(
+    (event: SyntheticEvent<HTMLTextAreaElement>) => {
+      const target = event.currentTarget;
+      setCursorPosition(target.selectionStart ?? target.value.length);
+    },
+    [],
+  );
+
+  const handleTextareaKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLTextAreaElement>) => {
+      if (showMentionMenu && mentionResults.length > 0) {
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          setMentionIndex((current) =>
+            Math.min(current + 1, mentionResults.length - 1),
+          );
+          return;
+        }
+        if (event.key === "ArrowUp") {
+          event.preventDefault();
+          setMentionIndex((current) => Math.max(current - 1, 0));
+          return;
+        }
+        if (event.key === "Enter") {
+          event.preventDefault();
+          const selected = mentionResults[mentionIndex];
+          if (selected) {
+            handleMentionSelect(selected);
+          }
+          return;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          setMentionIndex(0);
+          return;
+        }
+      }
+
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        void handlePrimaryAction();
+      }
+    },
+    [
+      handleMentionSelect,
+      handlePrimaryAction,
+      mentionIndex,
+      mentionResults,
+      showMentionMenu,
+    ],
+  );
+
+  const renderUserMessage = useCallback(
+    (content: string) => {
+      const tokens = tokenizeMentions(content, filesByPath);
+      return (
+        <p className="whitespace-pre-wrap">
+          {tokens.map((token, index) => {
+            if (token.type === "text") {
+              return <span key={`text-${index}`}>{token.value}</span>;
+            }
+            return (
+              <button
+                key={`mention-${token.file.id}-${index}`}
+                type="button"
+                onClick={() => handleOpenFile(token.file)}
+                className="underline decoration-dotted underline-offset-2"
+              >
+                {token.label}
+              </button>
+            );
+          })}
+        </p>
+      );
+    },
+    [filesByPath, handleOpenFile],
+  );
+
+  const renderAssistantMessage = useCallback(
+    (content: string) => {
+      const linked = linkifyMentions(content, filesByPath);
+      return (
+        <div className="prose prose-invert prose-sm max-w-none">
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            components={{
+              a: ({ href, children }) => {
+                if (href?.startsWith("file:")) {
+                  const id = href.slice("file:".length);
+                  const file = fileIndex.find((item) => item.id === id);
+                  if (file) {
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenFile(file)}
+                        className="text-primary underline decoration-dotted underline-offset-2"
+                      >
+                        {children}
+                      </button>
+                    );
+                  }
+                }
+                return (
+                  <a href={href} className="text-primary underline" rel="noreferrer">
+                    {children}
+                  </a>
+                );
+              },
+            }}
+          >
+            {linked}
+          </ReactMarkdown>
+        </div>
+      );
+    },
+    [fileIndex, filesByPath, handleOpenFile],
+  );
+
   return (
     <div className="flex h-full flex-col rounded-lg border border-border bg-background">
       <PastConversationsDialog
@@ -503,13 +895,9 @@ export const ConversationPanel = ({
                         "Something went wrong. Try again."}
                     </span>
                   ) : message.role === "assistant" ? (
-                    <div className="prose prose-invert prose-sm max-w-none">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {message.content}
-                      </ReactMarkdown>
-                    </div>
+                    renderAssistantMessage(message.content)
                   ) : (
-                    <p className="whitespace-pre-wrap">{message.content}</p>
+                    renderUserMessage(message.content)
                   )}
                 </div>
                 {message.role === "assistant" &&
@@ -535,19 +923,59 @@ export const ConversationPanel = ({
 
       <div className="border-t border-border p-3">
         <div className="space-y-2">
-          <Textarea
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            placeholder="Ask about this project..."
-            rows={3}
-            disabled={showCancel}
-            onKeyDown={(event) => {
-              if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-                event.preventDefault();
-                void handlePrimaryAction();
-              }
-            }}
-          />
+          <div className="relative">
+            <Textarea
+              ref={textareaRef}
+              value={input}
+              onChange={handleInputChange}
+              placeholder="Ask about this project..."
+              rows={3}
+              disabled={showCancel}
+              onKeyDown={handleTextareaKeyDown}
+              onClick={handleCursorUpdate}
+              onKeyUp={handleCursorUpdate}
+              onSelect={handleCursorUpdate}
+            />
+            {showMentionMenu && (
+              <div className="absolute bottom-full z-20 mb-1 w-full overflow-hidden rounded-md border border-border bg-background shadow-lg">
+                {fileIndexLoading ? (
+                  <div className="px-3 py-2 text-xs text-muted-foreground">
+                    Loading files...
+                  </div>
+                ) : fileIndexError ? (
+                  <div className="px-3 py-2 text-xs text-destructive">
+                    {fileIndexError}
+                  </div>
+                ) : mentionResults.length === 0 ? (
+                  <div className="px-3 py-2 text-xs text-muted-foreground">
+                    No matches found
+                  </div>
+                ) : (
+                  <div className="max-h-48 overflow-y-auto py-1">
+                    {mentionResults.map((file, index) => (
+                      <button
+                        key={file.id}
+                        type="button"
+                        className={cn(
+                          "flex w-full items-center justify-between px-3 py-1.5 text-left text-xs",
+                          index === mentionIndex
+                            ? "bg-muted text-foreground"
+                            : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                        )}
+                        onMouseEnter={() => setMentionIndex(index)}
+                        onClick={() => handleMentionSelect(file)}
+                      >
+                        <span className="truncate">{file.path}</span>
+                        <span className="ml-2 shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground">
+                          {file.type}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
           <div className="flex items-center justify-between">
             <span className="text-xs text-muted-foreground">
               {isProcessing

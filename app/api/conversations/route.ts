@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 import * as Sentry from "@sentry/nextjs";
 
 import { createClient } from "@/utils/supabase/server";
+import { cache } from "@/lib/redis";
 
 export const dynamic = "force-dynamic";
 
@@ -62,6 +63,18 @@ export async function GET(request: NextRequest) {
           );
         }
 
+        const cacheKey = `conversations:project:${projectId}`;
+        try {
+          const cached = await cache.get(cacheKey);
+          if (cached) {
+            return NextResponse.json({ conversations: cached, cached: true });
+          }
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "conversations_cache_get", projectId },
+          });
+        }
+
         const { data: conversations, error: conversationsError } = await supabase
           .from("conversations")
           .select("id, title, created_at, updated_at")
@@ -77,6 +90,14 @@ export async function GET(request: NextRequest) {
             },
             { status: 500 },
           );
+        }
+
+        try {
+          await cache.set(cacheKey, conversations ?? [], 60);
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "conversations_cache_set", projectId },
+          });
         }
 
         return NextResponse.json({ conversations: conversations ?? [] });
@@ -174,6 +195,14 @@ export async function POST(request: NextRequest) {
             { error: "Failed to create conversation" },
             { status: 500 },
           );
+        }
+
+        try {
+          await cache.del(`conversations:project:${projectId}`);
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "conversations_cache_invalidate", projectId },
+          });
         }
 
         return NextResponse.json({ conversation }, { status: 201 });

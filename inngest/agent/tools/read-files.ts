@@ -18,7 +18,8 @@ const inputSchema = z
 
 export const createReadFilesTool = ({ projectId }: ReadFilesToolOptions) =>
   tool({
-    description: "Read one or more files by ID or path and return their contents.",
+    description:
+      "Read one or more files by ID or path and return their contents. Prefer paths when you already know them.",
     inputSchema: zodSchema(inputSchema),
     execute: async ({ fileIds, paths }) => {
       const supabase = createAdminClient();

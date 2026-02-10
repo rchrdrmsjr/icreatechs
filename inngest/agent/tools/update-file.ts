@@ -15,7 +15,7 @@ const inputSchema = z.object({
 
 export const createUpdateFileTool = ({ projectId }: UpdateFileToolOptions) =>
   tool({
-    description: "Update a file's content by ID.",
+    description: "Update an existing file's content by ID.",
     inputSchema: zodSchema(inputSchema),
     execute: async ({ fileId, content }) => {
       const supabase = createAdminClient();

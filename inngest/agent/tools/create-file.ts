@@ -22,7 +22,8 @@ const inputSchema = z.object({
 
 export const createCreateFileTool = ({ projectId }: CreateFileToolOptions) =>
   tool({
-    description: "Create a single file in the project. Skips if it already exists.",
+    description:
+      "Create a new file in the project. If the file already exists, use updateFile instead.",
     inputSchema: zodSchema(inputSchema),
     execute: async ({ name, parentId, content }) => {
       const supabase = createAdminClient();

@@ -6,6 +6,7 @@ import { NonRetriableError } from "inngest";
 import { firecrawl } from "@/lib/firecrawl";
 import { createTelemetryConfig } from "@/lib/telemetry-config";
 import { createAdminClient } from "@/utils/supabase/admin";
+import { cache } from "@/lib/redis";
 import {
   CODING_AGENT_SYSTEM_PROMPT,
   TITLE_GENERATOR_SYSTEM_PROMPT,
@@ -373,6 +374,8 @@ export const processMessage = inngest.createFunction(
       const error = (context as { error?: unknown }).error;
       const originalEvent = event.data.event as { data?: ConversationMessageEvent };
       const messageId = originalEvent?.data?.messageId;
+      const conversationId = originalEvent?.data?.conversationId;
+      const projectId = originalEvent?.data?.projectId;
 
       if (!messageId) {
         return;
@@ -408,6 +411,18 @@ export const processMessage = inngest.createFunction(
           })
           .eq("id", messageId)
           .eq("status", "processing");
+      });
+
+      await step.run("invalidate-cache", async () => {
+        if (!conversationId || !projectId) return;
+        try {
+          await Promise.all([
+            cache.del(`messages:conversation:${conversationId}`),
+            cache.del(`conversations:project:${projectId}`),
+          ]);
+        } catch (cacheError) {
+          console.warn("[processMessage] cache invalidation failed", cacheError);
+        }
       });
     },
   },
@@ -541,14 +556,9 @@ export const processMessage = inngest.createFunction(
       }),
     };
 
-    const { text, usage, totalUsage, steps } = await step.run(
-      "generate-response",
-      async () => {
+    const generateResult = await step.run("generate-response", async () => {
       return await generateText({
-        model:
-          provider === "groq"
-            ? groq(selectedModel)
-            : google(selectedModel),
+        model: provider === "groq" ? groq(selectedModel) : google(selectedModel),
         system: systemPrompt,
         prompt: message,
         tools,
@@ -558,9 +568,24 @@ export const processMessage = inngest.createFunction(
           provider === "groq" ? "groq-conversation" : "gemini-conversation",
         ),
       });
-    },
-    );
+    });
 
+    const {
+      text,
+      usage,
+      totalUsage,
+      steps,
+    } = (generateResult ?? {}) as {
+      text?: unknown;
+      usage?: { totalTokens?: number };
+      totalUsage?: { totalTokens?: number };
+      steps?: unknown;
+    };
+    const outputText =
+      generateResult &&
+      typeof (generateResult as { _output?: unknown })._output === "string"
+        ? (generateResult as { _output: string })._output
+        : "";
     const primaryText = typeof text === "string" ? text : "";
     const stepText = extractTextFromSteps(steps);
     console.log("[processMessage] generate-response output", {
@@ -569,11 +594,14 @@ export const processMessage = inngest.createFunction(
       provider,
       model: selectedModel,
       hasText: Boolean(primaryText.trim()),
+      hasOutput: Boolean(outputText.trim()),
       stepsCount: Array.isArray(steps) ? steps.length : 0,
       stepTextLength: stepText.length,
+      outputTextLength: outputText.length,
     });
     const responseText =
       primaryText.trim() ||
+      outputText.trim() ||
       stepText.trim() ||
       "I processed your request. Let me know if you need anything else.";
 
@@ -596,6 +624,17 @@ export const processMessage = inngest.createFunction(
         .from("conversations")
         .update({ updated_at: new Date().toISOString() })
         .eq("id", conversationId);
+    });
+
+    await step.run("invalidate-cache", async () => {
+      try {
+        await Promise.all([
+          cache.del(`messages:conversation:${conversationId}`),
+          cache.del(`conversations:project:${projectId}`),
+        ]);
+      } catch (cacheError) {
+        console.warn("[processMessage] cache invalidation failed", cacheError);
+      }
     });
 
     return { success: true, messageId, conversationId, projectId };
