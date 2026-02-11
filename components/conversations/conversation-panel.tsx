@@ -1197,7 +1197,10 @@ export const ConversationPanel = ({
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-3 py-4" ref={scrollRef}>
+      <div
+        className="flex-1 overflow-y-auto overflow-x-hidden px-3 py-4"
+        ref={scrollRef}
+      >
         {loadingConversations && !activeConversation ? (
           <div className="flex h-full items-center justify-center text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -1218,7 +1221,7 @@ export const ConversationPanel = ({
               >
                 <div
                   className={cn(
-                    "max-w-[85%] rounded-lg px-3 py-2 text-sm",
+                    "max-w-[85%] break-words rounded-lg px-3 py-2 text-sm",
                     message.role === "user"
                       ? "bg-foreground text-background"
                       : "bg-muted text-foreground",
