@@ -763,7 +763,7 @@ export const processMessage = inngest.createFunction(
       }
     }
 
-    await step.run("update-assistant-message", async () => {
+    const updateResult = await step.run("update-assistant-message", async () => {
       const totalTokens =
         typeof totalUsage?.inputTokens === "number" ||
         typeof totalUsage?.outputTokens === "number"
@@ -772,27 +772,92 @@ export const processMessage = inngest.createFunction(
               typeof usage?.outputTokens === "number"
             ? (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0)
             : null;
-      await supabase
-        .from("messages")
-        .update({
-          content: responseText,
-          status: "completed",
+
+      const markFailed = async (failureMessage: string) => {
+        try {
+          await supabase
+            .from("messages")
+            .update({
+              status: "failed",
+              content: failureMessage,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", messageId)
+            .eq("status", "processing");
+        } catch (failureError) {
+          console.error("[processMessage] failed to mark message failed", {
+            messageId,
+            model: selectedModel,
+            error:
+              failureError instanceof Error
+                ? failureError.message
+                : "Unknown error",
+          });
+        }
+      };
+
+      try {
+        const { data, error } = await supabase
+          .from("messages")
+          .update({
+            content: responseText,
+            status: "completed",
+            model: selectedModel,
+            tokens_used: totalTokens,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", messageId)
+          .eq("status", "processing")
+          .select("id");
+
+        if (error) {
+          console.error("[processMessage] failed to update assistant message", {
+            messageId,
+            model: selectedModel,
+            error: error.message,
+          });
+          await markFailed(
+            "Failed to finalize response. Please try again.",
+          );
+          return { success: false };
+        }
+
+        if (!data || data.length === 0) {
+          console.warn("[processMessage] no message updated on completion", {
+            messageId,
+            model: selectedModel,
+          });
+          await markFailed(
+            "Failed to finalize response. Please try again.",
+          );
+          return { success: false };
+        }
+
+        return { success: true };
+      } catch (updateError) {
+        console.error("[processMessage] update assistant message threw", {
+          messageId,
           model: selectedModel,
-          tokens_used: totalTokens,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", messageId)
-        .eq("status", "processing");
+          error:
+            updateError instanceof Error
+              ? updateError.message
+              : "Unknown error",
+        });
+        await markFailed("Failed to finalize response. Please try again.");
+        return { success: false };
+      }
     });
 
-    await publishStreamEvent({
-      type: "done",
-      messageId,
-      conversationId,
-      projectId,
-      provider,
-      model: selectedModel,
-    });
+    if (updateResult?.success) {
+      await publishStreamEvent({
+        type: "done",
+        messageId,
+        conversationId,
+        projectId,
+        provider,
+        model: selectedModel,
+      });
+    }
 
     await step.run("touch-conversation", async () => {
       await supabase

@@ -129,10 +129,41 @@ export const createRenameFileTool = ({ projectId }: RenameFileToolOptions) =>
           return { error: moveError.message };
         }
 
-        await supabase
+        const { error: storagePathError } = await supabase
           .from("files")
           .update({ storage_path: newStoragePath })
           .eq("id", fileId);
+
+        if (storagePathError) {
+          console.error("[renameFile] failed to update storage path", {
+            fileId,
+            newStoragePath,
+            error: storagePathError.message,
+          });
+          const { error: rollbackError } = await storageClient.move(
+            newStoragePath,
+            oldStoragePath,
+          );
+          if (rollbackError) {
+            console.error("[renameFile] failed to rollback storage move", {
+              fileId,
+              from: newStoragePath,
+              to: oldStoragePath,
+              error: rollbackError.message,
+            });
+          }
+          await supabase
+            .from("files")
+            .update({
+              name: originalName,
+              path: oldPath,
+              parent_id: file.parent_id,
+              storage_path: oldStoragePath,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", fileId);
+          return { error: storagePathError.message };
+        }
 
         resolvedUpdatedFile.storage_path = newStoragePath;
       }

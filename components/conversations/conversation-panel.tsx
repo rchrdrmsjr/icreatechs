@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent, SyntheticEvent } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   ChevronDown,
@@ -279,9 +279,10 @@ export const ConversationPanel = ({
   const canCancel = showCancel && !cancelling;
   const canSend = !showCancel && !cancelling && Boolean(input.trim());
 
-  if (typeof performance !== "undefined") {
+  useLayoutEffect(() => {
+    if (typeof performance === "undefined") return;
     buttonRenderStartRef.current = performance.now();
-  }
+  }, [canCancel, canSend, showCancel]);
 
   const lastAssistantMessageId = useMemo(() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -553,11 +554,43 @@ export const ConversationPanel = ({
     }
 
     let mounted = true;
+    let authSubscription:
+      | ReturnType<typeof supabase.auth.onAuthStateChange>
+      | null = null;
 
-    const connectSocket = async () => {
+    const detachSocketHandlers = (socket: Socket) => {
+      socket.off("message:token", applyStreamDelta);
+      socket.off("message:done", markStreamDone);
+      socket.off("message:error", markStreamError);
+    };
+
+    const attachSocketHandlers = (socket: Socket) => {
+      socket.on("connect", () => {
+        setSocketConnected(true);
+        const currentConversationId = activeConversationIdRef.current;
+        if (currentConversationId) {
+          socket.emit("join", { conversationId: currentConversationId });
+        }
+      });
+
+      socket.on("disconnect", () => {
+        setSocketConnected(false);
+      });
+
+      socket.on("connect_error", () => {
+        setSocketConnected(false);
+      });
+
+      socket.on("message:token", applyStreamDelta);
+      socket.on("message:done", markStreamDone);
+      socket.on("message:error", markStreamError);
+    };
+
+    const connectSocket = async (accessTokenOverride?: string) => {
       try {
-        const { data } = await supabase.auth.getSession();
-        const accessToken = data.session?.access_token;
+        const accessToken =
+          accessTokenOverride ??
+          (await supabase.auth.getSession()).data.session?.access_token;
 
         if (!mounted) return;
 
@@ -567,40 +600,49 @@ export const ConversationPanel = ({
         });
 
         socketRef.current = socket;
-
-        socket.on("connect", () => {
-          setSocketConnected(true);
-          const currentConversationId = activeConversationIdRef.current;
-          if (currentConversationId) {
-            socket.emit("join", { conversationId: currentConversationId });
-          }
-        });
-
-        socket.on("disconnect", () => {
-          setSocketConnected(false);
-        });
-
-        socket.on("connect_error", () => {
-          setSocketConnected(false);
-        });
-
-        socket.on("message:token", applyStreamDelta);
-        socket.on("message:done", markStreamDone);
-        socket.on("message:error", markStreamError);
+        attachSocketHandlers(socket);
       } catch (error) {
         console.warn("Failed to initialize socket connection", error);
       }
     };
 
+    const reconnectSocket = async (nextAccessToken?: string) => {
+      const socket = socketRef.current;
+      if (socket) {
+        detachSocketHandlers(socket);
+        socket.disconnect();
+      }
+      socketRef.current = null;
+      setSocketConnected(false);
+      await connectSocket(nextAccessToken);
+    };
+
     void connectSocket();
+
+    authSubscription = supabase.auth.onAuthStateChange((event, session) => {
+      if (!mounted) return;
+      if (event === "SIGNED_OUT") {
+        const socket = socketRef.current;
+        if (socket) {
+          detachSocketHandlers(socket);
+          socket.disconnect();
+        }
+        socketRef.current = null;
+        setSocketConnected(false);
+        return;
+      }
+
+      if (event === "SIGNED_IN" || event === "TOKEN_REFRESHED") {
+        void reconnectSocket(session?.access_token);
+      }
+    });
 
     return () => {
       mounted = false;
+      authSubscription?.data?.subscription?.unsubscribe();
       const socket = socketRef.current;
       if (socket) {
-        socket.off("message:token", applyStreamDelta);
-        socket.off("message:done", markStreamDone);
-        socket.off("message:error", markStreamError);
+        detachSocketHandlers(socket);
         socket.disconnect();
       }
       socketRef.current = null;
@@ -932,10 +974,6 @@ export const ConversationPanel = ({
   const handlePrimaryAction = useCallback(async () => {
     if (showCancel) {
       if (!canCancel) return;
-      console.log("[ConversationPanel] Cancel click", {
-        conversationId: activeConversation?.id ?? null,
-        projectId,
-      });
       setSending(false);
       setCancelling(true);
       try {
@@ -948,10 +986,6 @@ export const ConversationPanel = ({
     }
 
     if (!canSend) return;
-    console.log("[ConversationPanel] Send click", {
-      conversationId: activeConversation?.id ?? null,
-      projectId,
-    });
     await handleSubmit();
   }, [
     activeConversation?.id,
@@ -962,16 +996,6 @@ export const ConversationPanel = ({
     projectId,
     showCancel,
   ]);
-
-  useEffect(() => {
-    if (typeof performance === "undefined") return;
-    if (buttonRenderStartRef.current === null) return;
-    const durationMs = performance.now() - buttonRenderStartRef.current;
-    console.log(
-      `[ConversationPanel] ${showCancel ? "Cancel" : "Send"} button render: ${durationMs.toFixed(2)}ms`,
-      { disabled: showCancel ? !canCancel : !canSend },
-    );
-  }, [canCancel, canSend, showCancel]);
 
   const handleCopyMessage = useCallback(async (message: ConversationMessage) => {
     try {
@@ -1129,6 +1153,9 @@ export const ConversationPanel = ({
         <div className="prose prose-invert prose-sm max-w-none">
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
+            urlTransform={(url) =>
+              url.startsWith("file:") ? url : defaultUrlTransform(url)
+            }
             components={{
               a: ({ href, children }) => {
                 if (href?.startsWith("file:")) {
