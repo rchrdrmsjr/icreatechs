@@ -3,7 +3,9 @@ import { cookies } from "next/headers";
 import * as Sentry from "@sentry/nextjs";
 
 import { createClient } from "@/utils/supabase/server";
+import { createAdminClient } from "@/utils/supabase/admin";
 import { inngest } from "@/inngest/client";
+import { cache } from "@/lib/redis";
 
 export const dynamic = "force-dynamic";
 
@@ -16,7 +18,7 @@ export async function POST(request: NextRequest) {
     },
     async () => {
       try {
-        const cookieStore = cookies();
+        const cookieStore = await cookies();
         const supabase = createClient(cookieStore);
 
         const {
@@ -80,7 +82,8 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ success: true, cancelled: false });
         }
 
-        const { data: processingMessages, error: processingError } = await supabase
+        const adminClient = createAdminClient();
+        const { data: processingMessages, error: processingError } = await adminClient
           .from("messages")
           .select("id")
           .in("conversation_id", conversationIds)
@@ -100,7 +103,7 @@ export async function POST(request: NextRequest) {
 
         const messageIds = processingMessages.map((msg) => msg.id);
 
-        const { error: updateError, status: updateStatus } = await supabase
+        const { error: updateError, status: updateStatus } = await adminClient
           .from("messages")
           .update({ status: "cancelled", updated_at: new Date().toISOString() })
           .in("id", messageIds);
@@ -130,6 +133,22 @@ export async function POST(request: NextRequest) {
             });
           }),
         );
+
+        try {
+          await Promise.all([
+            cache.del(`conversations:project:${projectId}`),
+            ...conversationIds.map((conversationId) =>
+              cache.del(`messages:conversation:${conversationId}`),
+            ),
+          ]);
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: {
+              operation: "messages_cancel_cache_invalidate",
+              projectId,
+            },
+          });
+        }
 
         return NextResponse.json({
           success: true,

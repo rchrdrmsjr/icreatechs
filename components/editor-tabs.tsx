@@ -45,7 +45,7 @@ export function EditorTabs({ savingIds }: EditorTabsProps) {
           )}
         >
           <FileIcon fileName={file.name} autoAssign={true} className="h-3.5 w-3.5" />
-          <span className="max-w-[140px] truncate">{file.name}</span>
+          <span className="max-w-35 truncate">{file.name}</span>
           <span className="text-[10px] text-muted-foreground">
             {savingIds?.has(file.id) ? (
               <Loader2 className="h-3 w-3 animate-spin" />

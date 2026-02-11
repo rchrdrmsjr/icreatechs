@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 import { createClient } from "@/utils/supabase/server";
 import { createAdminClient } from "@/utils/supabase/admin";
 import * as Sentry from "@sentry/nextjs";
+import { cache } from "@/lib/redis";
 
 export const dynamic = "force-dynamic";
 
@@ -55,7 +56,7 @@ export async function PATCH(
     async () => {
       try {
         const { id, fileId } = await params;
-        const cookieStore = cookies();
+        const cookieStore = await cookies();
         const supabase = createClient(cookieStore);
 
         const {
@@ -294,6 +295,14 @@ export async function PATCH(
           }
         }
 
+        try {
+          await cache.del(`project-files:${id}`);
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "project_files_cache_invalidate", projectId: id },
+          });
+        }
+
         return NextResponse.json({ file: resolvedUpdatedFile });
       } catch (error) {
         Sentry.captureException(error);
@@ -318,7 +327,7 @@ export async function DELETE(
     async () => {
       try {
         const { id, fileId } = await params;
-        const cookieStore = cookies();
+        const cookieStore = await cookies();
         const supabase = createClient(cookieStore);
 
         const {
@@ -406,6 +415,14 @@ export async function DELETE(
               }
             }
           }
+        }
+
+        try {
+          await cache.del(`project-files:${id}`);
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "project_files_cache_invalidate", projectId: id },
+          });
         }
 
         return NextResponse.json({ deletedPath: file.path });

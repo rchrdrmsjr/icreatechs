@@ -56,7 +56,7 @@ export default function SignInPage() {
       <div className="w-full max-w-md space-y-8">
         <div className="text-center">
           <Link href="/" className="text-2xl font-bold">
-            iCreaTechs
+           mortar
           </Link>
           <h1 className="mt-6 text-3xl font-bold">Welcome back</h1>
           <p className="mt-2 text-sm text-muted-foreground">

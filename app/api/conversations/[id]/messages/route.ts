@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 import * as Sentry from "@sentry/nextjs";
 
 import { createClient } from "@/utils/supabase/server";
+import { cache } from "@/lib/redis";
 
 export const dynamic = "force-dynamic";
 
@@ -57,6 +58,18 @@ export async function GET(
           );
         }
 
+        const cacheKey = `messages:conversation:${id}`;
+        try {
+          const cached = await cache.get(cacheKey);
+          if (cached) {
+            return NextResponse.json({ messages: cached, cached: true });
+          }
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "messages_cache_get", conversationId: id },
+          });
+        }
+
         const { data: messages, error: messagesError } = await supabase
           .from("messages")
           .select("id, role, content, status, created_at, updated_at, model")
@@ -69,6 +82,14 @@ export async function GET(
             { error: "Failed to fetch messages" },
             { status: 500 },
           );
+        }
+
+        try {
+          await cache.set(cacheKey, messages ?? [], 30);
+        } catch (cacheError) {
+          Sentry.captureException(cacheError, {
+            data: { operation: "messages_cache_set", conversationId: id },
+          });
         }
 
         return NextResponse.json({ messages: messages ?? [] });
