@@ -30,10 +30,24 @@ export const createDeleteFileTool = ({ projectId }: DeleteFileToolOptions) =>
         return { error: "File not found" };
       }
 
-      await supabase
+      const { data: updated, error: updateError } = await supabase
         .from("files")
         .update({ is_deleted: true, updated_at: new Date().toISOString() })
-        .eq("id", fileId);
+        .eq("id", fileId)
+        .eq("project_id", projectId)
+        .eq("is_deleted", false)
+        .select("id");
+
+      if (updateError || !updated || updated.length === 0) {
+        console.warn("[deleteFile] failed to mark file deleted", {
+          fileId,
+          projectId,
+          error: updateError?.message,
+        });
+        return {
+          error: updateError?.message ?? "Failed to delete file",
+        };
+      }
 
       const storageClient = supabase.storage.from("project-files");
 

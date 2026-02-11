@@ -23,13 +23,14 @@ export const createGetRecentMessagesTool = ({
         .from("messages")
         .select("id, role, content, status, created_at, updated_at, model")
         .eq("conversation_id", conversationId)
-        .order("created_at", { ascending: true })
+        .order("created_at", { ascending: false })
         .limit(limit ?? 10);
 
       if (error) {
         return { error: error.message, messages: [] };
       }
 
-      return { messages: data ?? [] };
+      const messages = (data ?? []).slice().reverse();
+      return { messages };
     },
   });

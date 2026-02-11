@@ -2,6 +2,7 @@ import { tool, zodSchema } from "ai";
 import { z } from "zod";
 
 import { createAdminClient } from "@/utils/supabase/admin";
+import { normalizeInputPath } from "./helpers";
 
 interface ReadFilesToolOptions {
   projectId: string;
@@ -24,6 +25,10 @@ export const createReadFilesTool = ({ projectId }: ReadFilesToolOptions) =>
     execute: async ({ fileIds, paths }) => {
       const supabase = createAdminClient();
 
+      const normalizedPaths = (paths ?? [])
+        .map((path) => normalizeInputPath(path))
+        .filter((path) => path.length > 0);
+
       let query = supabase
         .from("files")
         .select("id, name, path, type, content, storage_path")
@@ -32,8 +37,8 @@ export const createReadFilesTool = ({ projectId }: ReadFilesToolOptions) =>
 
       if (fileIds && fileIds.length > 0) {
         query = query.in("id", fileIds);
-      } else if (paths && paths.length > 0) {
-        query = query.in("path", paths);
+      } else if (normalizedPaths.length > 0) {
+        query = query.in("path", normalizedPaths);
       } else {
         return { files: [] };
       }

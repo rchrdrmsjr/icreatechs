@@ -46,6 +46,8 @@ type ConversationMessage = {
   created_at: string;
   updated_at?: string;
   model?: string | null;
+  clientId?: string;
+  optimistic?: boolean;
 };
 
 type StreamEvent = {
@@ -248,6 +250,7 @@ export const ConversationPanel = ({
   const lastFailureIdRef = useRef<string | null>(null);
   const wasProcessingRef = useRef(false);
   const activeConversationIdRef = useRef<string | null>(null);
+  const pendingUserMessageRef = useRef<{ id: string; content: string } | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const supabase = useMemo(() => createClient(), []);
   const openFile = useEditorStore((state) => state.openFile);
@@ -366,6 +369,55 @@ export const ConversationPanel = ({
   const upsertMessage = useCallback(
     (incoming: ConversationMessage) => {
       setMessages((prev) => {
+        if (incoming.role === "user") {
+          const pending = pendingUserMessageRef.current;
+          const incomingContent = incoming.content ?? "";
+          if (pending && incomingContent && incomingContent === pending.content) {
+            const pendingIndex = prev.findIndex((item) => item.id === pending.id);
+            if (pendingIndex !== -1) {
+              const next = [...prev];
+              next[pendingIndex] = {
+                ...next[pendingIndex],
+                ...incoming,
+                optimistic: false,
+              };
+              pendingUserMessageRef.current = null;
+              return sortMessages(next);
+            }
+          }
+
+          if (incomingContent) {
+            const incomingTime = incoming.created_at
+              ? Date.parse(incoming.created_at)
+              : NaN;
+            let bestIndex = -1;
+            let bestDiff = Number.POSITIVE_INFINITY;
+
+            prev.forEach((item, index) => {
+              if (item.role !== "user" || !item.optimistic) return;
+              if (item.content !== incomingContent) return;
+              const itemTime = item.created_at ? Date.parse(item.created_at) : NaN;
+              const diff = Number.isFinite(incomingTime) && Number.isFinite(itemTime)
+                ? Math.abs(incomingTime - itemTime)
+                : 0;
+              if (diff < bestDiff) {
+                bestDiff = diff;
+                bestIndex = index;
+              }
+            });
+
+            if (bestIndex !== -1 && (!Number.isFinite(bestDiff) || bestDiff <= 15000)) {
+              const next = [...prev];
+              next[bestIndex] = {
+                ...next[bestIndex],
+                ...incoming,
+                optimistic: false,
+              };
+              return sortMessages(next);
+            }
+          }
+        }
+
         const index = prev.findIndex((item) => item.id === incoming.id);
         if (index === -1) {
           return sortMessages([...prev, incoming]);
@@ -480,6 +532,10 @@ export const ConversationPanel = ({
 
   useEffect(() => {
     activeConversationIdRef.current = activeConversation?.id ?? null;
+  }, [activeConversation?.id]);
+
+  useEffect(() => {
+    pendingUserMessageRef.current = null;
   }, [activeConversation?.id]);
 
   useEffect(() => {
@@ -781,17 +837,22 @@ export const ConversationPanel = ({
       typeof crypto !== "undefined" && "randomUUID" in crypto
         ? crypto.randomUUID()
         : `temp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const tempUserId = makeTempId();
+    const tempAssistantId = makeTempId();
+    pendingUserMessageRef.current = { id: tempUserId, content: message };
     setMessages((prev) => [
       ...prev,
       {
-        id: makeTempId(),
+        id: tempUserId,
         role: "user",
         content: message,
         status: "completed",
         created_at: now,
+        clientId: tempUserId,
+        optimistic: true,
       },
       {
-        id: makeTempId(),
+        id: tempAssistantId,
         role: "assistant",
         content: "",
         status: "processing",

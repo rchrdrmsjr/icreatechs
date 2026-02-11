@@ -6,6 +6,17 @@ export const normalizePath = (parentPath: string | null, name: string) => {
   return basePath ? `${basePath}/${trimmedName}` : trimmedName;
 };
 
+export const normalizeInputPath = (rawPath: string) => {
+  let path = rawPath.trim();
+  if (path.startsWith("@")) {
+    path = path.slice(1);
+  }
+  path = path.replace(/\\/g, "/");
+  path = path.replace(/^\.?\//, "");
+  path = path.replace(/^\/+/, "");
+  return path;
+};
+
 export const normalizeParentId = (parentId?: string | null) =>
   parentId && parentId.trim() !== "" ? parentId : null;
 

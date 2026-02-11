@@ -37,6 +37,7 @@ export const createRenameFileTool = ({ projectId }: RenameFileToolOptions) =>
         return { error: "File not found" };
       }
 
+      const originalName = file.name;
       const trimmedName = name ? name.trim() : file.name;
       if (name !== undefined && !trimmedName) {
         return { error: "name cannot be empty" };
@@ -118,7 +119,11 @@ export const createRenameFileTool = ({ projectId }: RenameFileToolOptions) =>
         if (moveError) {
           await supabase
             .from("files")
-            .update({ path: oldPath, parent_id: file.parent_id })
+            .update({
+              name: originalName,
+              path: oldPath,
+              parent_id: file.parent_id,
+            })
             .eq("id", fileId);
 
           return { error: moveError.message };
@@ -145,29 +150,42 @@ export const createRenameFileTool = ({ projectId }: RenameFileToolOptions) =>
         }
 
         if (descendants && descendants.length > 0) {
-          await Promise.all(
-            descendants.map(async (child) => {
-              const childNewPath = `${newPath}${child.path.slice(oldPath.length)}`;
-              const updates: Record<string, any> = {
-                path: childNewPath,
-                updated_at: new Date().toISOString(),
-              };
+          for (const child of descendants) {
+            const childNewPath = `${newPath}${child.path.slice(oldPath.length)}`;
+            const updates: Record<string, any> = {
+              path: childNewPath,
+              updated_at: new Date().toISOString(),
+            };
 
-              if (child.storage_path) {
-                const childNewStoragePath = `${projectId}/${childNewPath}`;
-                const { error: moveError } = await storageClient.move(
-                  child.storage_path,
-                  childNewStoragePath,
-                );
+            if (child.storage_path) {
+              const childNewStoragePath = `${projectId}/${childNewPath}`;
+              const { error: moveError } = await storageClient.move(
+                child.storage_path,
+                childNewStoragePath,
+              );
 
-                if (!moveError) {
-                  updates.storage_path = childNewStoragePath;
-                }
+              if (moveError) {
+                console.error("[renameFile] failed to move descendant storage", {
+                  childId: child.id,
+                  from: child.storage_path,
+                  to: childNewStoragePath,
+                  error: moveError.message,
+                });
+                return { error: moveError.message };
               }
 
-              return supabase.from("files").update(updates).eq("id", child.id);
-            }),
-          );
+              updates.storage_path = childNewStoragePath;
+            }
+
+            const { error: updateChildError } = await supabase
+              .from("files")
+              .update(updates)
+              .eq("id", child.id);
+
+            if (updateChildError) {
+              return { error: updateChildError.message };
+            }
+          }
         }
       }
 

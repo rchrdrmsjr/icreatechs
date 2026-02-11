@@ -20,7 +20,15 @@
         "--project-ref=${input:SUPABASE_PROJECT_REF}"
       ],
       "gallery": "https://api.mcp.github.com"
-    }
+    },
+
+    "io.inngest/dev": {
+  "type": "http",
+  "url": "http://localhost:8288/mcp"
+}
+
+
+    
   },
   "inputs": [
     {

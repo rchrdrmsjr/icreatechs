@@ -48,24 +48,24 @@ const supabaseAdmin =
       })
     : null;
 
+const isDevelopment = process.env.NODE_ENV === "development";
 if (!supabaseAdmin) {
+  if (!isDevelopment) {
+    throw new Error("Supabase admin client not configured");
+  }
   console.warn(
-    "[socket] Supabase admin client not configured. Auth checks are disabled.",
+    "[socket] Supabase admin client not configured. Auth checks will fail in development.",
   );
 }
 
 io.use(async (socket, next) => {
-  if (!supabaseAdmin) {
-    return next();
-  }
-
   const token = socket.handshake.auth?.accessToken as string | undefined;
   if (!token) {
     return next(new Error("Unauthorized"));
   }
 
   try {
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    const { data, error } = await supabaseAdmin!.auth.getUser(token);
     if (error || !data?.user) {
       return next(new Error("Unauthorized"));
     }

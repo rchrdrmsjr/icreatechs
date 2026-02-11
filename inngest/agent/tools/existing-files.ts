@@ -2,6 +2,7 @@ import { tool, zodSchema } from "ai";
 import { z } from "zod";
 
 import { createAdminClient } from "@/utils/supabase/admin";
+import { normalizeInputPath } from "./helpers";
 
 interface ExistingFilesToolOptions {
   projectId: string;
@@ -18,12 +19,20 @@ export const createExistingFilesTool = ({ projectId }: ExistingFilesToolOptions)
     execute: async ({ paths }) => {
       const supabase = createAdminClient();
 
+      const normalizedPaths = paths
+        .map((path) => normalizeInputPath(path))
+        .filter((path) => path.length > 0);
+
+      if (normalizedPaths.length === 0) {
+        return { existing: [] };
+      }
+
       const { data, error } = await supabase
         .from("files")
         .select("id, name, type, parent_id, path")
         .eq("project_id", projectId)
         .eq("is_deleted", false)
-        .in("path", paths);
+        .in("path", normalizedPaths);
 
       if (error) {
         return { error: error.message, existing: [] };

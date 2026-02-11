@@ -327,6 +327,10 @@ const GROQ_MODELS = new Set([
 const DEFAULT_CONVERSATION_TITLE = "New conversation";
 const INTENT_VERB_REGEX =
   /\b(create|add|update|edit|delete|rename|refactor|implement|scaffold)\b/i;
+const CONTEXT_VERB_REGEX =
+  /\b(explain|review|read|show|summarize|walk\s+through|line\s+by\s+line|break\s+down)\b/i;
+const PATH_LIKE_REGEX =
+  /(?:^|\s)(?:[\w./-]+\.[\w]+|[\w-]+(?:[\\/][\w.-]+)+)(?:\s|$)/i;
 const FILE_MUTATION_TOOLS = new Set([
   "createFile",
   "createFiles",
@@ -458,7 +462,7 @@ export const processMessage = inngest.createFunction(
 
       const supabase = createAdminClient();
       await step.run("mark-message-failed", async () => {
-        await supabase
+        const { data, error: updateError } = await supabase
           .from("messages")
           .update({
             status: "failed",
@@ -466,7 +470,22 @@ export const processMessage = inngest.createFunction(
             updated_at: new Date().toISOString(),
           })
           .eq("id", messageId)
-          .eq("status", "processing");
+          .eq("status", "processing")
+          .select("id");
+        if (updateError) {
+          console.error("[processMessage] failed to mark message failed", {
+            messageId,
+            conversationId,
+            error: updateError.message,
+          });
+          throw updateError;
+        }
+        if (!data || (Array.isArray(data) && data.length === 0)) {
+          console.warn("[processMessage] no message updated on failure", {
+            messageId,
+            conversationId,
+          });
+        }
       });
 
       await step.run("notify-stream-error", async () => {
@@ -566,11 +585,19 @@ export const processMessage = inngest.createFunction(
       .join("\n\n");
 
     const wantsCodeChanges = INTENT_VERB_REGEX.test(message);
+    const needsCodeContext =
+      wantsCodeChanges ||
+      CONTEXT_VERB_REGEX.test(message) ||
+      PATH_LIKE_REGEX.test(message);
     let systemPrompt = wantsCodeChanges
       ? CODING_AGENT_SYSTEM_PROMPT
       : NEUTRAL_ASSISTANT_SYSTEM_PROMPT;
     if (historyText) {
       systemPrompt += `\n\n## Previous Conversation (for context only - do NOT repeat these responses):\n${historyText}\n\n## Current Request:\nRespond ONLY to the user's new message below. Do not repeat or reference your previous responses.`;
+    }
+    if (needsCodeContext) {
+      systemPrompt +=
+        "\n\nIf the user references a file, verify it exists (listFiles/existingFiles) and read it (readFiles) before answering. If it cannot be found, say so clearly.";
     }
     if (wantsCodeChanges) {
       systemPrompt +=
@@ -631,6 +658,19 @@ export const processMessage = inngest.createFunction(
         conversationId,
       }),
     };
+    const readOnlyTools = {
+      listFiles: tools.listFiles,
+      readFiles: tools.readFiles,
+      existingFiles: tools.existingFiles,
+      getProjectsFiles: tools.getProjectsFiles,
+      getFileById: tools.getFileById,
+      getRecentMessages: tools.getRecentMessages,
+    };
+    const selectedTools = wantsCodeChanges
+      ? tools
+      : needsCodeContext
+        ? readOnlyTools
+        : undefined;
 
     const streamChannel = `stream:conversation:${conversationId}`;
     const publishStreamEvent = async (payload: Record<string, unknown>) => {
@@ -646,7 +686,7 @@ export const processMessage = inngest.createFunction(
         model: provider === "groq" ? groq(selectedModel) : google(selectedModel),
         system: systemPrompt,
         prompt: message,
-        tools: wantsCodeChanges ? tools : undefined,
+        tools: selectedTools,
         stopWhen: stepCountIs(12),
         temperature: 0.3,
         experimental_telemetry: createTelemetryConfig(

@@ -44,12 +44,15 @@ export const createCreateFileTool = ({ projectId }: CreateFileToolOptions) =>
       const storagePath = `${projectId}/${path}`;
       const fileBlob = new Blob([fileContent], { type: "text/plain" });
 
-      const { error: uploadError } = await supabase.storage
-        .from("project-files")
-        .upload(storagePath, fileBlob, {
+      const storageClient = supabase.storage.from("project-files");
+      const { error: uploadError } = await storageClient.upload(
+        storagePath,
+        fileBlob,
+        {
           contentType: "text/plain",
           upsert: true,
-        });
+        },
+      );
 
       if (uploadError) {
         return { error: uploadError.message, path };
@@ -71,6 +74,17 @@ export const createCreateFileTool = ({ projectId }: CreateFileToolOptions) =>
         .single();
 
       if (error) {
+        const { error: removeError } = await storageClient.remove([
+          storagePath,
+        ]);
+        if (removeError) {
+          console.warn("[createFile] cleanup failed", {
+            projectId,
+            path,
+            storagePath,
+            error: removeError.message,
+          });
+        }
         return { error: error.message, path };
       }
 
