@@ -766,10 +766,10 @@ export const processMessage = inngest.createFunction(
     const updateResult = await step.run("update-assistant-message", async () => {
       const totalTokens =
         typeof totalUsage?.inputTokens === "number" ||
-        typeof totalUsage?.outputTokens === "number"
+          typeof totalUsage?.outputTokens === "number"
           ? (totalUsage?.inputTokens ?? 0) + (totalUsage?.outputTokens ?? 0)
           : typeof usage?.inputTokens === "number" ||
-              typeof usage?.outputTokens === "number"
+            typeof usage?.outputTokens === "number"
             ? (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0)
             : null;
 
@@ -878,5 +878,145 @@ export const processMessage = inngest.createFunction(
     });
 
     return { success: true, messageId, conversationId, projectId };
+  },
+);
+
+/**
+ * Cleanup job: Permanently delete files that have been soft-deleted for 30+ days
+ * Runs daily at 2 AM UTC to clean up database and storage
+ */
+export const cleanupDeletedFiles = inngest.createFunction(
+  {
+    id: "cleanup-deleted-files",
+    retries: 3,
+  },
+  { cron: "0 2 * * *" }, // Run daily at 2 AM UTC
+  async ({ step }) => {
+    const supabase = createAdminClient();
+    const storageClient = createAdminClient();
+
+    // Calculate cutoff date (30 days ago)
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - 30);
+    const cutoffTimestamp = cutoffDate.toISOString();
+
+    // Step 1: Find files to permanently delete
+    const filesToDelete = await step.run("find-files-to-delete", async () => {
+      const { data, error } = await supabase
+        .from("files")
+        .select("id, storage_path, project_id, path, type")
+        .eq("is_deleted", true)
+        .lt("updated_at", cutoffTimestamp);
+
+      if (error) {
+        console.error("[cleanupDeletedFiles] Error fetching files:", error);
+        throw error;
+      }
+
+      return data || [];
+    });
+
+    if (filesToDelete.length === 0) {
+      return {
+        success: true,
+        deletedCount: 0,
+        message: "No files to cleanup",
+      };
+    }
+
+    console.log(
+      `[cleanupDeletedFiles] Found ${filesToDelete.length} files to permanently delete`,
+    );
+
+    // Step 2: Delete from storage
+    const storageDeleteResults = await step.run(
+      "delete-from-storage",
+      async () => {
+        const storagePaths = filesToDelete
+          .map((file) => file.storage_path)
+          .filter((path): path is string => path !== null);
+
+        if (storagePaths.length === 0) {
+          return { deletedCount: 0 };
+        }
+
+        console.log(
+          `[cleanupDeletedFiles] Deleting ${storagePaths.length} files from storage`,
+        );
+
+        const { data, error } = await storageClient.storage
+          .from("project-files")
+          .remove(storagePaths);
+
+        if (error) {
+          console.error(
+            "[cleanupDeletedFiles] Error deleting from storage:",
+            error,
+          );
+          // Don't throw - continue with database cleanup even if storage fails
+        }
+
+        return {
+          deletedCount: storagePaths.length,
+          errors: error ? [error.message] : [],
+        };
+      },
+    );
+
+    // Step 3: Permanently delete from database
+    const dbDeleteResults = await step.run(
+      "delete-from-database",
+      async () => {
+        const fileIds = filesToDelete.map((file) => file.id);
+
+        const { error } = await supabase
+          .from("files")
+          .delete()
+          .in("id", fileIds);
+
+        if (error) {
+          console.error(
+            "[cleanupDeletedFiles] Error deleting from database:",
+            error,
+          );
+          throw error;
+        }
+
+        return { deletedCount: fileIds.length };
+      },
+    );
+
+    // Step 4: Invalidate cache for affected projects
+    await step.run("invalidate-cache", async () => {
+      const projectIds = [
+        ...new Set(filesToDelete.map((file) => file.project_id)),
+      ];
+
+      try {
+        await Promise.all(
+          projectIds.map((projectId) =>
+            cache.del(`project-files:${projectId}`),
+          ),
+        );
+      } catch (cacheError) {
+        console.warn(
+          "[cleanupDeletedFiles] Cache invalidation failed:",
+          cacheError,
+        );
+        // Don't throw - cache invalidation failure is not critical
+      }
+    });
+
+    const result = {
+      success: true,
+      totalFilesFound: filesToDelete.length,
+      storageDeleted: storageDeleteResults.deletedCount,
+      databaseDeleted: dbDeleteResults.deletedCount,
+      cutoffDate: cutoffTimestamp,
+    };
+
+    console.log("[cleanupDeletedFiles] Cleanup completed:", result);
+
+    return result;
   },
 );

@@ -14,6 +14,10 @@ type ProjectUpdate = Partial<{
   language: string;
   framework: string;
   visibility: "public" | "private" | "team";
+  settings: {
+    installCommand?: string;
+    devCommand?: string;
+  };
 }>;
 
 // GET /api/projects/[id] - Get single project and update last_accessed_at
@@ -120,7 +124,7 @@ export async function PATCH(
         }
 
         const body = await request.json();
-        const { name, description, language, framework, visibility } = body;
+        const { name, description, language, framework, visibility, settings } = body;
 
         // Verify user has access to project
         const { data: project, error: projectError } = await supabase
@@ -128,6 +132,7 @@ export async function PATCH(
           .select(
             `
             id,
+            settings,
             workspace_id,
             workspaces!inner (
               workspace_members!inner (
@@ -161,6 +166,20 @@ export async function PATCH(
         if (language !== undefined) updates.language = language;
         if (framework !== undefined) updates.framework = framework;
         if (visibility !== undefined) updates.visibility = visibility;
+        if (settings !== undefined) {
+          if (!settings || typeof settings !== "object") {
+            return NextResponse.json(
+              { error: "settings must be an object" },
+              { status: 400 },
+            );
+          }
+          const existingSettings = (project as { settings?: Record<string, unknown> })
+            .settings ?? {};
+          updates.settings = {
+            ...existingSettings,
+            ...settings,
+          };
+        }
 
         // Reject if no updatable fields provided
         if (Object.keys(updates).length === 0) {
@@ -282,8 +301,10 @@ export async function DELETE(
         }
 
         // Check if user has admin or owner role
-        const memberRole = (project.workspaces as any).workspace_members[0]
-          .role;
+        const workspaceMembers = (
+          project.workspaces as { workspace_members?: Array<{ role?: string }> }
+        ).workspace_members ?? [];
+        const memberRole = workspaceMembers[0]?.role;
         if (!["owner", "admin"].includes(memberRole)) {
           return NextResponse.json(
             { error: "You don't have permission to delete this project" },

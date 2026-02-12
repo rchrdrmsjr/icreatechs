@@ -160,15 +160,17 @@ export function FileExplorer({ projectId, onOpenFile }: FileExplorerProps) {
     setDialogOpen(true);
   };
 
-  const openRenameDialog = () => {
-    if (!selectedFile) return;
-    setRenameValue(selectedFile.name);
+  const openRenameDialog = (fileId?: string) => {
+    const file = fileId ? fileById.get(fileId) : selectedFile;
+    if (!file) return;
+    setRenameValue(file.name);
     setRenameError(null);
     setRenameOpen(true);
   };
 
-  const openDeleteDialog = () => {
-    if (!selectedFile) return;
+  const openDeleteDialog = (fileId?: string) => {
+    const file = fileId ? fileById.get(fileId) : selectedFile;
+    if (!file) return;
     setDeleteError(null);
     setDeleteOpen(true);
   };
@@ -519,7 +521,7 @@ export function FileExplorer({ projectId, onOpenFile }: FileExplorerProps) {
           <ContextMenuItem
             onClick={() => {
               setSelectedId(node.id);
-              openRenameDialog();
+              openRenameDialog(node.id);
             }}
           >
             <Pencil className="h-4 w-4" />
@@ -529,7 +531,7 @@ export function FileExplorer({ projectId, onOpenFile }: FileExplorerProps) {
           <ContextMenuItem
             onClick={() => {
               setSelectedId(node.id);
-              openDeleteDialog();
+              openDeleteDialog(node.id);
             }}
             className="text-destructive"
           >
@@ -542,11 +544,11 @@ export function FileExplorer({ projectId, onOpenFile }: FileExplorerProps) {
   };
 
   return (
-    <div 
+    <div
       className={cn(
         "space-y-2 -m-3 p-3 min-h-screen h-full border-l-2 transition-colors",
-        selectedId === null 
-          ? "border-l-primary bg-primary/5" 
+        selectedId === null
+          ? "border-l-primary bg-primary/5"
           : "border-l-transparent",
         isRootDropActive && "ring-1 ring-primary/60"
       )}

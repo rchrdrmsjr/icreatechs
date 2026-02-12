@@ -14,8 +14,8 @@ import {
   Terminal,
   Monitor,
   Eye,
-  Wand2,
-  Globe,
+  RefreshCw,
+  AlertTriangle,
 } from "lucide-react";
 import Link from "next/link";
 import * as Sentry from "@sentry/nextjs";
@@ -34,13 +34,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { FileExplorer } from "@/components/file-explorer";
 import { EditorTabs } from "@/components/editor-tabs";
 import { useEditorStore } from "@/lib/editor-store";
 import { ConversationPanel } from "@/components/conversations/conversation-panel";
+import { useWebContainer } from "@/hooks/use-webcontainer";
+import { PreviewTerminal } from "@/components/preview/preview-terminal";
+import { PreviewSettingsPopover } from "@/components/preview/preview-settings-popover";
 
 interface Project {
   id: string;
@@ -54,6 +55,10 @@ interface Project {
   last_accessed_at: string;
   created_at: string;
   updated_at: string;
+  settings?: {
+    installCommand?: string;
+    devCommand?: string;
+  };
 }
 
 type ViewMode = "code" | "preview";
@@ -120,18 +125,13 @@ export default function ProjectDetailPage() {
   const [viewMode, setViewMode] = useState<ViewMode>("code");
   const editorRef = useRef<CodeEditorHandle | null>(null);
   const contentByIdRef = useRef<Map<string, string>>(new Map());
-  const [aiProvider, setAiProvider] = useState<"gemini" | "groq">("gemini");
+  const [aiProvider] = useState<"gemini" | "groq">("gemini");
   const [aiModel, setAiModel] = useState("gemini-2.5-flash");
-  const [selectionText, setSelectionText] = useState("");
-  const [selectionStats, setSelectionStats] = useState({ lines: 0, chars: 0 });
   const [quickEditOpen, setQuickEditOpen] = useState(false);
   const [quickEditInstruction, setQuickEditInstruction] = useState("");
   const [quickEditIncludeExplanation, setQuickEditIncludeExplanation] = useState(false);
   const [quickEditExplanation, setQuickEditExplanation] = useState<string | null>(null);
   const [quickEditLoading, setQuickEditLoading] = useState(false);
-  const [scrapeUrl, setScrapeUrl] = useState("");
-  const [scrapeLoading, setScrapeLoading] = useState<"blocking" | "queue" | null>(null);
-  const [scrapeResult, setScrapeResult] = useState<string | null>(null);
   const availableModels = useMemo<string[]>(
     () =>
       aiProvider === "groq"
@@ -145,6 +145,42 @@ export default function ProjectDetailPage() {
   const setFileContent = useEditorStore((state) => state.setFileContent);
   const setFileDirty = useEditorStore((state) => state.setFileDirty);
   const setFileLoading = useEditorStore((state) => state.setFileLoading);
+  const filesToSync = useMemo(
+    () =>
+      openFiles
+        .filter((file) => !file.isLoading)
+        .map((file) => ({ path: file.path, content: file.content })),
+    [openFiles],
+  );
+
+  const previewEnabled = Boolean(
+    project?.id &&
+      (workspaceMode === "preview" ||
+        (workspaceMode === "code" && viewMode === "preview")),
+  );
+
+  const {
+    status: previewStatus,
+    previewUrl,
+    error: previewError,
+    restart: restartPreview,
+  } = useWebContainer({
+    projectId: project?.id ?? "",
+    enabled: previewEnabled,
+    settings: project?.settings,
+    filesToSync,
+  });
+
+  const handlePreviewSettingsSave = useCallback(
+    (settings: { installCommand?: string; devCommand?: string }) => {
+      setProject((prev) => (prev ? { ...prev, settings } : prev));
+      restartPreview();
+    },
+    [restartPreview],
+  );
+
+  const isPreviewLoading =
+    previewStatus === "booting" || previewStatus === "installing";
 
   const activeFile = useMemo(
     () => openFiles.find((file) => file.id === activeFileId) ?? null,
@@ -253,59 +289,9 @@ export default function ProjectDetailPage() {
     quickEditInstruction,
   ]);
 
-  const handleSelectionChange = useCallback((selection: string) => {
-    if (!selection) {
-      setSelectionText("");
-      setSelectionStats({ lines: 0, chars: 0 });
-      return;
-    }
-    setSelectionText(selection);
-    setSelectionStats({ lines: selection.split("\n").length, chars: selection.length });
+  const handleSelectionChange = useCallback(() => {
+    // Selection is read directly from the editor handle when needed.
   }, []);
-
-  const handleScrape = useCallback(
-    async (mode: "blocking" | "queue") => {
-      const url = scrapeUrl.trim();
-      if (!url) {
-        toast("Enter a URL to scrape.");
-        return;
-      }
-
-      setScrapeLoading(mode);
-      setScrapeResult(null);
-
-      try {
-        const response = await fetch(
-          mode === "blocking" ? "/api/firecrawl/blocking" : "/api/firecrawl/non-blocking",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ url, formats: ["markdown"] }),
-          },
-        );
-
-        const payload = await response.json();
-        if (!response.ok) {
-          throw new Error(payload?.error ?? "Failed to scrape URL");
-        }
-
-        if (mode === "queue") {
-          setScrapeResult(`Queued job ${payload.requestId}`);
-        } else {
-          const markdown = payload?.data?.markdown ?? "";
-          setScrapeResult(
-            markdown ? markdown.slice(0, 800) : "Scrape completed with no markdown.",
-          );
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Failed to scrape URL";
-        toast.error(message);
-      } finally {
-        setScrapeLoading(null);
-      }
-    },
-    [scrapeUrl],
-  );
 
   const fetchProject = async (id: string) => {
     return Sentry.startSpan(
@@ -743,117 +729,109 @@ export default function ProjectDetailPage() {
                 </div>
 
                 {/* Terminal/Preview Content */}
-                <div className="flex-1 overflow-y-auto p-4">
-                  {viewMode === "code" ? (
-                    <div className="space-y-3">
-                      <div className="text-sm font-medium flex items-center gap-2">
-                        <Terminal className="h-4 w-4" />
-                        Terminal Output
+                <div className="flex-1 min-h-0 flex flex-col">
+                  <div className="flex items-center justify-between border-b border-border px-3 py-2 text-xs text-muted-foreground">
+                    <div className="flex items-center gap-2">
+                      {isPreviewLoading && (
+                        <>
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          <span>
+                            {previewStatus === "booting"
+                              ? "Starting container..."
+                              : "Installing dependencies..."}
+                          </span>
+                        </>
+                      )}
+                      {!isPreviewLoading && previewError && (
+                        <>
+                          <AlertTriangle className="h-3 w-3 text-destructive" />
+                          <span className="text-destructive">{previewError}</span>
+                        </>
+                      )}
+                      {!isPreviewLoading && !previewError && previewUrl && (
+                        <span className="truncate">{previewUrl}</span>
+                      )}
+                      {!isPreviewLoading && !previewError && !previewUrl && (
+                        <span>Ready to preview</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-full rounded-none"
+                        onClick={restartPreview}
+                        disabled={isPreviewLoading}
+                        title="Restart container"
+                      >
+                        <RefreshCw className="h-3 w-3" />
+                      </Button>
+                      {project?.id && (
+                        <PreviewSettingsPopover
+                          projectId={project.id}
+                          initialValues={project.settings}
+                          onSave={handlePreviewSettingsSave}
+                        />
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex-1 min-h-0">
+                    {viewMode === "code" ? (
+                      <div className="h-full flex flex-col">
+                        <PreviewTerminal />
                       </div>
-                      <div className="rounded-lg bg-muted p-3 font-mono text-xs">
-                        <div className="text-green-500">$ npm run dev</div>
-                        <div className="text-muted-foreground mt-2">
-                          Ready on http://localhost:3000
-                        </div>
-                      </div>
-                      <div className="rounded-lg bg-muted p-3 text-sm space-y-3">
-                        <div className="font-medium flex items-center gap-2">
-                          <Wand2 className="h-4 w-4" />
-                          AI Tools
-                        </div>
-                        <div className="space-y-2">
-                          <div className="text-xs text-muted-foreground">
-                            Quick edit selected code with Cmd/Ctrl+K.
-                          </div>
-                          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                            <span>Provider</span>
-                            <NativeSelect
-                              size="sm"
-                              value={aiProvider}
-                              onChange={(event) =>
-                                setAiProvider(event.target.value as "gemini" | "groq")
-                              }
-                            >
-                              <NativeSelectOption value="gemini">Gemini 2.5 Flash</NativeSelectOption>
-                              <NativeSelectOption value="groq">Groq Llama 3.3 70B</NativeSelectOption>
-                            </NativeSelect>
-                          </div>
-                          <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                            <span>Model</span>
-                            <NativeSelect
-                              size="sm"
-                              value={aiModel}
-                              onChange={(event) => setAiModel(event.target.value)}
-                            >
-                              {availableModels.map((modelId: string) => (
-                                <NativeSelectOption key={modelId} value={modelId}>
-                                  {modelId}
-                                </NativeSelectOption>
-                              ))}
-                            </NativeSelect>
-                          </div>
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="secondary"
-                            onClick={openQuickEdit}
-                          >
-                            Edit Selection
-                          </Button>
-                        </div>
-                        <div className="border-t border-border pt-3 space-y-2">
-                          <div className="text-xs text-muted-foreground flex items-center gap-2">
-                            <Globe className="h-3.5 w-3.5" />
-                            Firecrawl scrape
-                          </div>
-                          <Input
-                            placeholder="https://example.com"
-                            value={scrapeUrl}
-                            onChange={(event) => setScrapeUrl(event.target.value)}
-                          />
-                          <div className="flex gap-2">
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="secondary"
-                              disabled={scrapeLoading !== null}
-                              onClick={() => handleScrape("blocking")}
-                            >
-                              {scrapeLoading === "blocking" ? "Scraping..." : "Scrape"}
-                            </Button>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              disabled={scrapeLoading !== null}
-                              onClick={() => handleScrape("queue")}
-                            >
-                              {scrapeLoading === "queue" ? "Queueing..." : "Queue"}
-                            </Button>
-                          </div>
-                          {scrapeResult && (
-                            <div className="rounded-md border border-border bg-background p-2 text-xs text-muted-foreground max-h-40 overflow-y-auto whitespace-pre-wrap">
-                              {scrapeResult}
+                    ) : (
+                      <>
+                        {previewError && (
+                          <div className="flex-1 flex items-center justify-center text-muted-foreground">
+                            <div className="text-center space-y-2">
+                              <AlertTriangle className="mx-auto h-6 w-6 text-destructive" />
+                              <p className="text-sm">{previewError}</p>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={restartPreview}
+                              >
+                                <RefreshCw className="h-4 w-4" />
+                                Restart
+                              </Button>
                             </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="h-full flex items-center justify-center">
-                      <div className="text-center space-y-3">
-                        <div className="mx-auto w-16 h-16 rounded-full bg-accent flex items-center justify-center">
-                          <Eye className="h-8 w-8 text-muted-foreground" />
-                        </div>
-                        <div>
-                          <div className="text-lg font-semibold">Live Preview</div>
-                          <div className="text-sm text-muted-foreground">
-                            Preview will render your app here
                           </div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
+                        )}
+                        {isPreviewLoading && !previewError && (
+                          <div className="flex h-full items-center justify-center text-muted-foreground">
+                            <div className="flex flex-col items-center gap-2">
+                              <Loader2 className="h-6 w-6 animate-spin" />
+                              <p className="text-sm">Preparing preview...</p>
+                            </div>
+                          </div>
+                        )}
+                        {!isPreviewLoading && !previewError && previewUrl && (
+                          <iframe
+                            src={previewUrl}
+                            className="h-full w-full border-0"
+                            title="Preview"
+                          />
+                        )}
+                        {!isPreviewLoading && !previewError && !previewUrl && (
+                          <div className="h-full flex items-center justify-center">
+                            <div className="text-center space-y-3">
+                              <div className="mx-auto w-16 h-16 rounded-full bg-accent flex items-center justify-center">
+                                <Eye className="h-8 w-8 text-muted-foreground" />
+                              </div>
+                              <div>
+                                <div className="text-lg font-semibold">Live Preview</div>
+                                <div className="text-sm text-muted-foreground">
+                                  Preview will render your app here
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
                 </div>
               </div>
             </ResizablePanel>
@@ -882,13 +860,96 @@ export default function ProjectDetailPage() {
 
                 <ResizablePanel defaultSize={70} minSize={45}>
                   <div className="h-full p-4">
-                    <div className="h-full rounded-lg border border-border bg-muted/20 p-4 flex items-center justify-center min-h-0">
-                      <div className="text-center space-y-2">
-                        <Eye className="mx-auto h-8 w-8 text-muted-foreground" />
-                        <div className="text-sm font-semibold">Live Preview</div>
-                        <div className="text-xs text-muted-foreground">
-                          Preview will render your app here
+                    <div className="h-full rounded-lg border border-border bg-muted/20 min-h-0 flex flex-col overflow-hidden">
+                      <div className="flex items-center justify-between border-b border-border bg-background px-3 py-2 text-xs text-muted-foreground">
+                        <div className="flex items-center gap-2">
+                          {isPreviewLoading && (
+                            <>
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                              <span>
+                                {previewStatus === "booting"
+                                  ? "Starting container..."
+                                  : "Installing dependencies..."}
+                              </span>
+                            </>
+                          )}
+                          {!isPreviewLoading && previewError && (
+                            <>
+                              <AlertTriangle className="h-3 w-3 text-destructive" />
+                              <span className="text-destructive">{previewError}</span>
+                            </>
+                          )}
+                          {!isPreviewLoading && !previewError && previewUrl && (
+                            <span className="truncate">{previewUrl}</span>
+                          )}
+                          {!isPreviewLoading && !previewError && !previewUrl && (
+                            <span>Ready to preview</span>
+                          )}
                         </div>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-full rounded-none"
+                            onClick={restartPreview}
+                            disabled={isPreviewLoading}
+                            title="Restart container"
+                          >
+                            <RefreshCw className="h-3 w-3" />
+                          </Button>
+                          {project?.id && (
+                            <PreviewSettingsPopover
+                              projectId={project.id}
+                              initialValues={project.settings}
+                              onSave={handlePreviewSettingsSave}
+                            />
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="flex-1 min-h-0">
+                        {previewError && (
+                          <div className="h-full flex items-center justify-center text-muted-foreground">
+                            <div className="text-center space-y-2">
+                              <AlertTriangle className="mx-auto h-6 w-6 text-destructive" />
+                              <div className="text-sm">{previewError}</div>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={restartPreview}
+                              >
+                                <RefreshCw className="h-4 w-4" />
+                                Restart
+                              </Button>
+                            </div>
+                          </div>
+                        )}
+                        {isPreviewLoading && !previewError && (
+                          <div className="h-full flex items-center justify-center text-muted-foreground">
+                            <div className="flex flex-col items-center gap-2">
+                              <Loader2 className="h-6 w-6 animate-spin" />
+                              <p className="text-sm">Preparing preview...</p>
+                            </div>
+                          </div>
+                        )}
+                        {!isPreviewLoading && !previewError && previewUrl && (
+                          <iframe
+                            src={previewUrl}
+                            className="h-full w-full border-0"
+                            title="Preview"
+                          />
+                        )}
+                        {!isPreviewLoading && !previewError && !previewUrl && (
+                          <div className="h-full flex items-center justify-center">
+                            <div className="text-center space-y-2">
+                              <Eye className="mx-auto h-8 w-8 text-muted-foreground" />
+                              <div className="text-sm font-semibold">Live Preview</div>
+                              <div className="text-xs text-muted-foreground">
+                                Preview will render your app here
+                              </div>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
