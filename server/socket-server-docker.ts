@@ -67,9 +67,28 @@ if (!supabaseAdmin) {
 
 // Track PTY sessions
 const ptySessions = new Map<string, PTYSession>();
+const sessionLastActivity = new Map<string, number>();
 
 // Start idle container cleanup
 startIdleCleanup();
+
+// Cleanup idle PTY sessions (30min timeout)
+setInterval(() => {
+    const now = Date.now();
+    const timeout = 30 * 60 * 1000; // 30 minutes
+
+    for (const [sessionId, lastActivity] of sessionLastActivity.entries()) {
+        if (now - lastActivity > timeout) {
+            const ptySession = ptySessions.get(sessionId);
+            if (ptySession) {
+                console.log(`[socket] Cleaning up idle session ${sessionId}`);
+                ptySession.kill();
+                ptySessions.delete(sessionId);
+            }
+            sessionLastActivity.delete(sessionId);
+        }
+    }
+}, 5 * 60 * 1000); // Check every 5 minutes
 
 // Authentication middleware
 io.use(async (socket, next) => {
@@ -164,6 +183,7 @@ io.on("connection", (socket) => {
 
                 ptySessions.set(sessionId, ptySession);
                 socketSessionIds.add(sessionId);
+                sessionLastActivity.set(sessionId, Date.now());
 
                 // Touch container to update last accessed time
                 touchContainer({ projectId, userId });
@@ -272,18 +292,56 @@ io.on("connection", (socket) => {
         socketSessionIds.delete(sessionId);
     });
 
-    // Handle disconnect
-    socket.on("disconnect", () => {
-        // Kill all PTY sessions for this socket
-        for (const sessionId of socketSessionIds) {
-            const ptySession = ptySessions.get(sessionId);
-            if (ptySession) {
-                ptySession.kill();
-                ptySessions.delete(sessionId);
-            }
+    // Terminal: Reconnect to existing session
+    socket.on("terminal:reconnect", (payload?: { sessionId?: string; projectId?: string }) => {
+        const sessionId = payload?.sessionId;
+        const projectId = payload?.projectId;
+
+        if (!sessionId || !projectId) {
+            socket.emit("terminal:error", {
+                sessionId,
+                error: "Session ID and Project ID are required",
+            });
+            return;
         }
+
+        // Check if session still exists
+        const ptySession = ptySessions.get(sessionId);
+        if (!ptySession) {
+            socket.emit("terminal:session-expired", { sessionId });
+            return;
+        }
+
+        // Reattach socket to existing PTY
+        socketSessionIds.add(sessionId);
+
+        // Touch container to update last accessed
+        touchContainer({ projectId, userId });
+
+        // Send reconnected event
+        socket.emit("terminal:reconnected", {
+            sessionId,
+            shell: "bash",
+            cwd: "/workspace",
+        });
+
+        // Reattach data stream
+        ptySession.onData((data) => {
+            socket.emit("terminal:data", {
+                sessionId,
+                data,
+            });
+        });
+
+        console.log(`[socket] Reconnected to session ${sessionId}`);
+    });
+
+    // Handle disconnect - DON'T kill PTY sessions
+    socket.on("disconnect", () => {
+        // Just detach socket, keep PTY alive
+        // Sessions will be cleaned up by timeout (30min)
         socketSessionIds.clear();
-        console.log("[socket] client disconnected", socket.id);
+        console.log("[socket] client disconnected (sessions kept alive)", socket.id);
     });
 });
 

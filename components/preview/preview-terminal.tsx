@@ -1,13 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { io, type Socket } from "socket.io-client";
-import { Terminal } from "@xterm/xterm";
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { io, Socket } from "socket.io-client";
+import { Terminal as XTerm, type ITerminalOptions } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { RefreshCw } from "lucide-react";
+import { Terminal, X, RefreshCw } from "lucide-react";
 
 import { createClient } from "@/utils/supabase/client";
+import { useTerminalStore } from "@/lib/terminal-store";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
 
 import "@xterm/xterm/css/xterm.css";
 
@@ -38,7 +46,7 @@ type ErrorEvent = {
 
 export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const terminalRef = useRef<Terminal | null>(null);
+  const terminalRef = useRef<XTerm | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -57,7 +65,7 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
 
   const writeLine = useCallback((text: string) => {
     if (!terminalRef.current) return;
-    terminalRef.current.write(`${text}\r\n`);
+    terminalRef.current.write(`${text} \r\n`);
   }, []);
 
   const startTerminal = useCallback(
@@ -73,7 +81,7 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
       const nextSessionId =
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
-          : `terminal-${Date.now()}`;
+          : `terminal - ${Date.now()} `;
 
       setStarting(true);
       setErrorMessage(null);
@@ -121,7 +129,18 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
 
         socket.on("connect", () => {
           setConnected(true);
-          startTerminal(selectedShellRef.current);
+
+          // Try to reconnect to existing session first
+          const existingSessionId = useTerminalStore.getState().getSession(projectId);
+          if (existingSessionId) {
+            writeLine(`Reconnecting to session ${existingSessionId}...`);
+            socket.emit("terminal:reconnect", {
+              sessionId: existingSessionId,
+              projectId,
+            });
+          } else {
+            startTerminal(selectedShellRef.current);
+          }
         });
 
         socket.on("disconnect", () => {
@@ -132,7 +151,7 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
           setConnected(false);
           setStarting(false);
           setErrorMessage(error.message || "Socket connection failed.");
-          writeLine(`[socket] ${error.message || "connection failed"}`);
+          writeLine(`[socket] ${error.message || "connection failed"} `);
         });
 
         socket.on("terminal:started", (payload: StartedEvent) => {
@@ -140,10 +159,30 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
           if (activeSessionId && payload.sessionId !== activeSessionId) return;
           setSessionId(payload.sessionId);
           sessionIdRef.current = payload.sessionId;
+
+          // Save session to store
+          useTerminalStore.getState().setSession(projectId, payload.sessionId);
+
           setStarting(false);
           setErrorMessage(null);
           setCwd(payload.cwd);
-          writeLine(`Connected to ${payload.shell} at ${payload.cwd}`);
+          writeLine(`Connected to ${payload.shell} at ${payload.cwd} `);
+        });
+
+        socket.on("terminal:reconnected", (payload: StartedEvent) => {
+          setSessionId(payload.sessionId);
+          sessionIdRef.current = payload.sessionId;
+          setStarting(false);
+          setErrorMessage(null);
+          setCwd(payload.cwd);
+          writeLine(`Reconnected to ${payload.shell} session`);
+        });
+
+        socket.on("terminal:session-expired", () => {
+          writeLine(`Session expired, starting new terminal...`);
+          // Clear expired session from store
+          useTerminalStore.getState().clearSession(projectId);
+          startTerminal(selectedShellRef.current);
         });
 
         socket.on("terminal:data", (payload: DataEvent) => {
@@ -157,7 +196,7 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
           const activeSessionId = sessionIdRef.current;
           if (activeSessionId && payload.sessionId !== activeSessionId) return;
           writeLine(
-            `\r\n[process exited] code=${payload.code ?? "null"} signal=${payload.signal ?? "null"}`,
+            `\r\n[process exited]code = ${payload.code ?? "null"} signal = ${payload.signal ?? "null"} `,
           );
           setStarting(false);
         });
@@ -170,7 +209,7 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
           const message = payload.error || "Terminal error";
           setErrorMessage(message);
           setStarting(false);
-          writeLine(`\r\n[terminal error] ${message}`);
+          writeLine(`\r\n[terminal error] ${message} `);
         });
       } catch (error) {
         setErrorMessage(
@@ -187,9 +226,8 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
       mounted = false;
       const socket = socketRef.current;
       if (socket) {
-        if (sessionIdRef.current) {
-          socket.emit("terminal:stop", { sessionId: sessionIdRef.current });
-        }
+        // Don't stop the terminal - let it persist in background
+        // Just disconnect the socket
         socket.disconnect();
       }
       socketRef.current = null;
@@ -199,7 +237,7 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
 
   useEffect(() => {
     if (!containerRef.current || terminalRef.current) return;
-    const terminal = new Terminal({
+    const terminal = new XTerm({
       convertEol: true,
       disableStdin: false,
       cursorBlink: true,
@@ -235,7 +273,7 @@ export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
       return;
     }
 
-    const onDataDispose = terminalRef.current.onData((data) => {
+    const onDataDispose = terminalRef.current.onData((data: string) => {
       if (!sessionId) return;
       socketRef.current?.emit("terminal:input", { sessionId, data });
     });
