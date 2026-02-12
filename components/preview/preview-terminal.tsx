@@ -11,7 +11,8 @@ import { Button } from "@/components/ui/button";
 
 import "@xterm/xterm/css/xterm.css";
 
-type TerminalShell = "powershell" | "cmd" | "gitbash";
+// Terminal now runs bash inside Docker containers
+type TerminalShell = "bash";
 
 type StartedEvent = {
   sessionId: string;
@@ -35,15 +36,15 @@ type ErrorEvent = {
   error: string;
 };
 
-export const PreviewTerminal = () => {
+export const PreviewTerminal = ({ projectId }: { projectId: string }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
-  const selectedShellRef = useRef<TerminalShell>("powershell");
+  const selectedShellRef = useRef<TerminalShell>("bash");
 
-  const [selectedShell, setSelectedShell] = useState<TerminalShell>("powershell");
+  const [selectedShell, setSelectedShell] = useState<TerminalShell>("bash");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [cwd, setCwd] = useState<string>("");
   const [connected, setConnected] = useState(false);
@@ -51,7 +52,8 @@ export const PreviewTerminal = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const supabase = useMemo(() => createClient(), []);
-  const socketUrl = process.env.NEXT_PUBLIC_SOCKET_SERVER_URL;
+  // Connect to Docker socket server for Linux containers
+  const socketUrl = process.env.NEXT_PUBLIC_DOCKER_SOCKET_SERVER_URL;
 
   const writeLine = useCallback((text: string) => {
     if (!terminalRef.current) return;
@@ -84,7 +86,7 @@ export const PreviewTerminal = () => {
 
       socket.emit("terminal:start", {
         sessionId: nextSessionId,
-        shell,
+        projectId,
       });
     },
     [writeLine],
@@ -246,21 +248,11 @@ export const PreviewTerminal = () => {
   return (
     <div className="h-full flex flex-col bg-sidebar">
       <div className="flex items-center gap-2 border-b border-border/50 px-3 py-2 text-xs">
-        <select
-          value={selectedShell}
-          onChange={(event) => {
-            const nextShell = event.target.value as TerminalShell;
-            setSelectedShell(nextShell);
-            if (connected) {
-              startTerminal(nextShell);
-            }
-          }}
-          className="rounded border border-border bg-background px-2 py-1 text-xs"
-        >
-          <option value="powershell">PowerShell</option>
-          <option value="cmd">Command Prompt</option>
-          <option value="gitbash">Git Bash</option>
-        </select>
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span className="font-medium">bash</span>
+          <span>•</span>
+          <span>Linux Container</span>
+        </div>
         <Button
           size="sm"
           variant="outline"

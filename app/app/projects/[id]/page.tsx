@@ -155,8 +155,8 @@ export default function ProjectDetailPage() {
 
   const previewEnabled = Boolean(
     project?.id &&
-      (workspaceMode === "preview" ||
-        (workspaceMode === "code" && viewMode === "preview")),
+    (workspaceMode === "preview" ||
+      (workspaceMode === "code" && viewMode === "preview")),
   );
 
   const {
@@ -705,11 +705,10 @@ export default function ProjectDetailPage() {
                   <button
                     type="button"
                     onClick={() => setViewMode("code")}
-                    className={`flex items-center gap-2 px-4 py-2 text-sm border-b-2 transition-colors ${
-                      viewMode === "code"
+                    className={`flex items-center gap-2 px-4 py-2 text-sm border-b-2 transition-colors ${viewMode === "code"
                         ? "border-foreground text-foreground font-medium"
                         : "border-transparent text-muted-foreground hover:text-foreground"
-                    }`}
+                      }`}
                   >
                     <Terminal className="h-4 w-4" />
                     Terminal
@@ -717,11 +716,10 @@ export default function ProjectDetailPage() {
                   <button
                     type="button"
                     onClick={() => setViewMode("preview")}
-                    className={`flex items-center gap-2 px-4 py-2 text-sm border-b-2 transition-colors ${
-                      viewMode === "preview"
+                    className={`flex items-center gap-2 px-4 py-2 text-sm border-b-2 transition-colors ${viewMode === "preview"
                         ? "border-foreground text-foreground font-medium"
                         : "border-transparent text-muted-foreground hover:text-foreground"
-                    }`}
+                      }`}
                   >
                     <Monitor className="h-4 w-4" />
                     Preview
@@ -779,7 +777,7 @@ export default function ProjectDetailPage() {
                   <div className="flex-1 min-h-0">
                     {viewMode === "code" ? (
                       <div className="h-full flex flex-col">
-                        <PreviewTerminal />
+                        <PreviewTerminal projectId={project.id} />
                       </div>
                     ) : (
                       <>
