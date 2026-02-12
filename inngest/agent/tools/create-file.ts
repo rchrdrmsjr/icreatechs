@@ -28,12 +28,12 @@ export const createCreateFileTool = ({ projectId }: CreateFileToolOptions) =>
     execute: async ({ name, parentId, content }) => {
       const supabase = createAdminClient();
       const resolvedParentId = normalizeParentId(parentId);
-      const parentPath = await loadParentPath(
+      const parentInfo = await loadParentPath(
         supabase,
         projectId,
         resolvedParentId,
       );
-      const path = normalizePath(parentPath, name);
+      const path = normalizePath(parentInfo?.path ?? null, name);
 
       const existing = await findFileByPath(supabase, projectId, path);
       if (existing) {
@@ -64,7 +64,7 @@ export const createCreateFileTool = ({ projectId }: CreateFileToolOptions) =>
           project_id: projectId,
           name: name.trim(),
           type: "file",
-          parent_id: resolvedParentId,
+          parent_id: parentInfo?.id ?? null,
           path,
           content: null,
           size_bytes: computeSizeBytes(fileContent),
@@ -72,6 +72,7 @@ export const createCreateFileTool = ({ projectId }: CreateFileToolOptions) =>
         })
         .select("id, name, type, parent_id, path, storage_path")
         .single();
+
 
       if (error) {
         const { error: removeError } = await storageClient.remove([
@@ -85,9 +86,21 @@ export const createCreateFileTool = ({ projectId }: CreateFileToolOptions) =>
             error: removeError.message,
           });
         }
-        return { error: error.message, path };
+        return {
+          success: false,
+          error: error.message,
+          name,
+          path
+        };
       }
 
-      return { status: "created", file: created };
+      return {
+        success: true,
+        id: created.id,
+        name: created.name,
+        path: created.path,
+        file: created
+      };
     },
   });
+

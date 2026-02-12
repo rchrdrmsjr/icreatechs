@@ -33,6 +33,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { createBrowserClient } from "@supabase/ssr";
 
 interface FileRecord {
   id: string;
@@ -60,32 +61,32 @@ function sortNodes(nodes: FileNode[]) {
   });
 }
 
-function buildTree(files: FileRecord[]) {
-  const byId = new Map<string, FileNode>();
-
-  for (const file of files) {
-    byId.set(file.id, { ...file, children: [] });
-  }
-
+function buildTree(files: FileRecord[]): FileNode[] {
+  const nodeMap = new Map<string, FileNode>();
   const roots: FileNode[] = [];
 
-  for (const node of byId.values()) {
-    if (node.parent_id && byId.has(node.parent_id)) {
-      byId.get(node.parent_id)!.children.push(node);
-    } else {
-      roots.push(node);
-    }
-  }
+  files.forEach((file) => {
+    nodeMap.set(file.id, { ...file, children: [] });
+  });
 
-  const normalize = (nodes: FileNode[]) => {
-    const sorted = sortNodes(nodes);
-    sorted.forEach((child) => {
-      if (child.children.length > 0) {
-        child.children = normalize(child.children);
+  files.forEach((file) => {
+    const node = nodeMap.get(file.id)!;
+    if (file.parent_id === null) {
+      roots.push(node);
+    } else {
+      const parent = nodeMap.get(file.parent_id);
+      if (parent) {
+        parent.children.push(node);
       }
-    });
-    return sorted;
-  };
+    }
+  });
+
+  function normalize(nodes: FileNode[]): FileNode[] {
+    return sortNodes(nodes).map((node) => ({
+      ...node,
+      children: normalize(node.children),
+    }));
+  }
 
   return normalize(roots);
 }
@@ -140,8 +141,38 @@ export function FileExplorer({ projectId, onOpenFile }: FileExplorerProps) {
 
     fetchFiles();
 
+    // Set up Supabase realtime subscription for file changes
+    const supabase = createBrowserClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY!
+    );
+
+    const channel = supabase
+      .channel(`files:project:${projectId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*", // Listen to INSERT, UPDATE, DELETE
+          schema: "public",
+          table: "files",
+          filter: `project_id=eq.${projectId}`,
+        },
+        (payload) => {
+          console.log("[file-explorer] Realtime update:", payload);
+          // Refetch files when any change occurs
+          fetchFiles();
+        }
+      )
+      .subscribe((status) => {
+        console.log("[file-explorer] Subscription status:", status);
+        if (status === "CHANNEL_ERROR") {
+          console.error("[file-explorer] Realtime subscription failed");
+        }
+      });
+
     return () => {
       mounted = false;
+      channel.unsubscribe();
     };
   }, [projectId]);
 

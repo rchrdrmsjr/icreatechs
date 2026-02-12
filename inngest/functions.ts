@@ -410,6 +410,176 @@ const extractToolNamesFromSteps = (steps: unknown) => {
   return toolNames;
 };
 
+/**
+ * Generates response based on ACTUAL tool results, not AI predictions
+ * This prevents hallucination where AI claims files were created when they failed
+ */
+const generateVerifiedResponse = (
+  steps: unknown,
+  streamedText: string,
+): string => {
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return streamedText || "I processed your request.";
+  }
+
+  const results = {
+    created: [] as string[],
+    failed: [] as Array<{ file: string; error: string }>,
+    updated: [] as string[],
+    deleted: [] as string[],
+    renamed: [] as string[],
+  };
+
+  // Parse tool results to extract actual outcomes
+  for (const step of steps) {
+    if (!step || typeof step !== "object") continue;
+
+    const content = (step as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+
+    for (const item of content) {
+      if (!item || typeof item !== "object") continue;
+
+      const toolItem = item as {
+        toolName?: string;
+        args?: { name?: string; files?: Array<{ name?: string }> };
+        result?: {
+          error?: string;
+          success?: boolean;
+          id?: string;
+          created?: Array<{ name?: string }>;
+        };
+      };
+
+      const toolName = toolItem.toolName;
+      const args = toolItem.args;
+      const result = toolItem.result;
+
+      if (!toolName || !result) continue;
+
+      // Check createFile results
+      if (toolName === "createFile") {
+        const fileName = args?.name || "unknown file";
+        if (result.error) {
+          results.failed.push({ file: fileName, error: result.error });
+        } else if (result.success || result.id) {
+          results.created.push(fileName);
+        }
+      }
+
+      // Check createFiles results
+      if (toolName === "createFiles") {
+        const files = args?.files || [];
+        if (result.created && Array.isArray(result.created)) {
+          result.created.forEach((file) => {
+            if (file?.name) results.created.push(file.name);
+          });
+        }
+        if (result.error) {
+          files.forEach((file) => {
+            if (file?.name) {
+              results.failed.push({ file: file.name, error: result.error ?? "Unknown error" });
+            }
+          });
+        }
+      }
+
+      // Check updateFile results
+      if (toolName === "updateFile") {
+        const fileName = args?.name || "file";
+        if (result.error) {
+          results.failed.push({ file: fileName, error: result.error });
+        } else if (result.success || result.id) {
+          results.updated.push(fileName);
+        }
+      }
+
+      // Check deleteFile results
+      if (toolName === "deleteFile") {
+        const fileName = args?.name || "file";
+        if (result.error) {
+          results.failed.push({ file: fileName, error: result.error });
+        } else if (result.success) {
+          results.deleted.push(fileName);
+        }
+      }
+
+      // Check renameFile results
+      if (toolName === "renameFile") {
+        const fileName = args?.name || "file";
+        if (result.error) {
+          results.failed.push({ file: fileName, error: result.error });
+        } else if (result.success) {
+          results.renamed.push(fileName);
+        }
+      }
+
+      // Check createFolder results
+      if (toolName === "createFolder") {
+        const folderName = args?.name || "folder";
+        if (result.error) {
+          results.failed.push({ file: folderName, error: result.error });
+        } else if (result.success || result.id) {
+          results.created.push(folderName);
+        }
+      }
+    }
+  }
+
+  // Check if any file operations occurred
+  const hasFileOps =
+    results.created.length > 0 ||
+    results.failed.length > 0 ||
+    results.updated.length > 0 ||
+    results.deleted.length > 0 ||
+    results.renamed.length > 0;
+
+  // If no file operations, return streamed text
+  if (!hasFileOps) {
+    return streamedText || "I processed your request.";
+  }
+
+  // Build verified response based on actual results
+  let response = "";
+
+  if (results.created.length > 0) {
+    response += `✅ Created: ${results.created.join(", ")}\n`;
+  }
+
+  if (results.updated.length > 0) {
+    response += `✅ Updated: ${results.updated.join(", ")}\n`;
+  }
+
+  if (results.deleted.length > 0) {
+    response += `✅ Deleted: ${results.deleted.join(", ")}\n`;
+  }
+
+  if (results.renamed.length > 0) {
+    response += `✅ Renamed: ${results.renamed.join(", ")}\n`;
+  }
+
+  if (results.failed.length > 0) {
+    response += `❌ Failed:\n`;
+    results.failed.forEach(({ file, error }) => {
+      response += `  - ${file}: ${error}\n`;
+    });
+  }
+
+  // If we have verified file operations, append relevant parts of streamed text
+  // (avoiding hallucinated claims)
+  if (response && streamedText) {
+    const lines = streamedText.split("\n");
+    const nonClaimLines = lines.filter((line) => !FILE_CLAIM_REGEX.test(line));
+    const extraInfo = nonClaimLines.join("\n").trim();
+    if (extraInfo) {
+      response += `\n${extraInfo}`;
+    }
+  }
+
+  return response.trim() || "Completed file operations.";
+};
+
+
 const stripFileClaims = (text: string) => {
   if (!text.trim()) {
     return text;
@@ -748,10 +918,7 @@ export const processMessage = inngest.createFunction(
       streamedTextLength: streamedText?.length ?? 0,
       ranFileMutationTool,
     });
-    let responseText =
-      (streamedText ?? "").trim() ||
-      stepText.trim() ||
-      "I processed your request. Let me know if you need anything else.";
+    let responseText = generateVerifiedResponse(steps, streamedText ?? "");
     if (!ranFileMutationTool) {
       const cleaned = stripFileClaims(responseText);
       if (cleaned.trim() !== responseText.trim()) {

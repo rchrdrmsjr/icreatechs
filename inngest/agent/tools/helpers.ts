@@ -24,27 +24,51 @@ export const loadParentPath = async (
   supabase: ReturnType<typeof createAdminClient>,
   projectId: string,
   parentId: string | null,
-) => {
+): Promise<{ id: string; path: string } | null> => {
   if (!parentId) return null;
 
-  const { data: parent, error: parentError } = await supabase
-    .from("files")
-    .select("id, path, type")
-    .eq("id", parentId)
-    .eq("project_id", projectId)
-    .eq("is_deleted", false)
-    .maybeSingle();
+  // Check if parentId looks like a UUID (36 chars with hyphens in correct positions)
+  const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(parentId);
 
-  if (parentError || !parent) {
-    throw new Error("Parent folder not found");
+  let parent;
+
+  if (isUUID) {
+    // Query by ID (original behavior for UUID format)
+    const { data, error: parentError } = await supabase
+      .from("files")
+      .select("id, path, type")
+      .eq("id", parentId)
+      .eq("project_id", projectId)
+      .eq("is_deleted", false)
+      .maybeSingle();
+
+    if (parentError || !data) {
+      throw new Error("Parent folder not found");
+    }
+    parent = data;
+  } else {
+    // Query by path (fallback for when AI uses folder name/path)
+    const { data, error: parentError } = await supabase
+      .from("files")
+      .select("id, path, type")
+      .eq("path", parentId)
+      .eq("project_id", projectId)
+      .eq("is_deleted", false)
+      .maybeSingle();
+
+    if (parentError || !data) {
+      throw new Error("Parent folder not found");
+    }
+    parent = data;
   }
 
   if (parent.type !== "folder") {
     throw new Error("Parent must be a folder");
   }
 
-  return parent.path;
+  return { id: parent.id, path: parent.path };
 };
+
 
 export const findFileByPath = async (
   supabase: ReturnType<typeof createAdminClient>,

@@ -35,13 +35,13 @@ export const createCreateFilesTool = ({ projectId }: CreateFilesToolOptions) =>
 
       const results = await Promise.all(
         files.map(async (file) => {
-          const parentPath = await loadParentPath(
+          const parentInfo = await loadParentPath(
             supabase,
             projectId,
             normalizeParentId(file.parentId),
           );
           const resolvedParentId = normalizeParentId(file.parentId);
-          const path = normalizePath(parentPath, file.name);
+          const path = normalizePath(parentInfo?.path ?? null, file.name);
 
           const existing = await findFileByPath(supabase, projectId, path);
           if (existing) {
@@ -71,7 +71,7 @@ export const createCreateFilesTool = ({ projectId }: CreateFilesToolOptions) =>
               project_id: projectId,
               name: file.name.trim(),
               type: "file",
-              parent_id: resolvedParentId,
+              parent_id: parentInfo?.id ?? null,
               path,
               content: null,
               size_bytes: computeSizeBytes(content),
@@ -81,13 +81,21 @@ export const createCreateFilesTool = ({ projectId }: CreateFilesToolOptions) =>
             .single();
 
           if (error) {
-            return { error: error.message, path };
+            return { success: false, error: error.message, name: file.name, path };
           }
 
-          return { status: "created", file: created };
+          return { success: true, id: created.id, name: created.name, path: created.path, file: created };
         }),
       );
 
-      return { results };
+      const created = results.filter(r => r.success).map(r => ({ name: r.name, id: r.id }));
+      const failed = results.filter(r => !r.success).map(r => ({ name: r.name, error: r.error }));
+
+      return {
+        success: failed.length === 0,
+        created,
+        failed: failed.length > 0 ? failed : undefined,
+        error: failed.length > 0 ? `${failed.length} file(s) failed to create` : undefined
+      };
     },
   });

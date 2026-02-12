@@ -25,12 +25,12 @@ export const createCreateFolderTool = ({ projectId }: CreateFolderToolOptions) =
     execute: async ({ name, parentId }) => {
       const supabase = createAdminClient();
       const resolvedParentId = normalizeParentId(parentId);
-      const parentPath = await loadParentPath(
+      const parentInfo = await loadParentPath(
         supabase,
         projectId,
         resolvedParentId,
       );
-      const path = normalizePath(parentPath, name);
+      const path = normalizePath(parentInfo?.path ?? null, name);
 
       const existing = await findFileByPath(supabase, projectId, path);
       if (existing) {
@@ -43,7 +43,7 @@ export const createCreateFolderTool = ({ projectId }: CreateFolderToolOptions) =
           project_id: projectId,
           name: name.trim(),
           type: "folder",
-          parent_id: resolvedParentId,
+          parent_id: parentInfo?.id ?? null,
           path,
           content: null,
           size_bytes: null,
@@ -53,9 +53,10 @@ export const createCreateFolderTool = ({ projectId }: CreateFolderToolOptions) =
         .single();
 
       if (error) {
-        return { error: error.message };
+        return { success: false, error: error.message, name };
       }
 
-      return { status: "created", folder };
+      return { success: true, id: folder.id, name: folder.name, path: folder.path, folder };
     },
   });
+
